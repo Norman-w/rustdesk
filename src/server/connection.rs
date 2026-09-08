@@ -20,7 +20,8 @@ use crate::platform::WallPaperRemover;
 use crate::portable_service::client as portable_client;
 use crate::{
     client::{
-        new_voice_call_request, new_voice_call_response, start_audio_thread, MediaData, MediaSender,
+        configured_remote_mic_output_device, new_voice_call_request, new_voice_call_response,
+        start_audio_thread_with_output_device, MediaData, MediaSender,
     },
     display_service, ipc, privacy_mode, video_service, VERSION,
 };
@@ -3527,7 +3528,23 @@ impl Connection {
                         if !self.disable_audio {
                             // Drop the audio sender previously.
                             drop(std::mem::replace(&mut self.audio_sender, None));
-                            self.audio_sender = Some(start_audio_thread());
+                            // A voice call carries the remote microphone. Keep ordinary
+                            // remote system audio on the normal speaker, but allow an
+                            // explicitly configured virtual output device for voice input.
+                            let output_device_name = if self.voice_calling {
+                                configured_remote_mic_output_device()
+                            } else {
+                                None
+                            };
+                            if let Some(name) = output_device_name.as_deref() {
+                                log::info!(
+                                    "Routing incoming voice-call audio to configured output device: \"{}\"",
+                                    name
+                                );
+                            }
+                            self.audio_sender = Some(start_audio_thread_with_output_device(
+                                output_device_name,
+                            ));
                             self.audio_sender
                                 .as_ref()
                                 .map(|a| allow_err!(a.send(MediaData::AudioFormat(format))));
