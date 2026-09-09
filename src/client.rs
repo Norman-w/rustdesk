@@ -3052,10 +3052,43 @@ pub fn start_video_thread<F, T>(
 pub fn configured_remote_mic_output_device() -> Option<String> {
     #[cfg(target_os = "macos")]
     {
-        return std::env::var("NORMAN_REMOTE_MIC_OUTPUT_DEVICE")
+        if let Some(name) = std::env::var("NORMAN_REMOTE_MIC_OUTPUT_DEVICE")
             .ok()
             .map(|name| name.trim().to_owned())
-            .filter(|name| !name.is_empty());
+            .filter(|name| !name.is_empty())
+        {
+            return Some(name);
+        }
+
+        // Finder-launched RustDesk does not inherit the CM helper's
+        // environment. Read the helper's explicit, user-approved plist as a
+        // fallback so the main receiver and --cm-no-ui use the same route.
+        // The plist is only consulted when `enabled` is true; an absent or
+        // malformed file keeps the normal default-speaker behavior.
+        let home = std::env::var_os("HOME")?;
+        let config_path = std::path::PathBuf::from(home)
+            .join("Library/Application Support/NormanRemoteDesktop/cm-helper/audio-config.plist");
+        let content = std::fs::read_to_string(config_path).ok()?;
+        let enabled_region = content
+            .split_once("<key>enabled</key>")
+            .and_then(|(_, rest)| rest.split_once("<key>"))
+            .map(|(value, _)| value)
+            .unwrap_or("");
+        if !enabled_region.contains("<true/>") {
+            return None;
+        }
+        let value_region = content
+            .split_once("<key>outputDeviceName</key>")
+            .and_then(|(_, rest)| rest.split_once("<key>").map(|(value, _)| value))
+            .unwrap_or("");
+        let value_start = value_region.find("<string>")? + "<string>".len();
+        let value_end = value_region[value_start..].find("</string>")? + value_start;
+        let name = value_region[value_start..value_end].trim();
+        if name.is_empty() {
+            None
+        } else {
+            Some(name.to_owned())
+        }
     }
     #[cfg(not(target_os = "macos"))]
     {

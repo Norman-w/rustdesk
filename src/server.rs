@@ -391,6 +391,13 @@ impl Server {
             if Self::is_video_service_name(&name) && name != primary_video_service_name {
                 continue;
             }
+            // The Norman macOS receiver accepts phone microphone audio through
+            // the voice-call output route. It must never subscribe this
+            // connection to the controlled Mac's physical microphone service.
+            #[cfg(target_os = "macos")]
+            if name == audio_service::NAME {
+                continue;
+            }
             if !noperms.contains(&(&name as _)) {
                 s.on_subscribe(conn.clone());
             }

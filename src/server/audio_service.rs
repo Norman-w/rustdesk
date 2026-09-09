@@ -261,6 +261,12 @@ mod cpal_impl {
 
     #[cfg(feature = "screencapturekit")]
     fn get_device() -> ResultType<(Device, SupportedStreamConfig)> {
+        #[cfg(target_os = "macos")]
+        {
+            return Err(anyhow!(
+                "controlled-device microphone capture is disabled in the Norman macOS receiver"
+            ));
+        }
         let audio_input = super::get_audio_input();
         if !audio_input.is_empty() {
             return get_audio_input(&audio_input);
@@ -303,6 +309,12 @@ mod cpal_impl {
 
     #[cfg(not(any(windows, feature = "screencapturekit")))]
     fn get_device() -> ResultType<(Device, SupportedStreamConfig)> {
+        #[cfg(target_os = "macos")]
+        {
+            return Err(anyhow!(
+                "controlled-device microphone capture is disabled in the Norman macOS receiver"
+            ));
+        }
         let audio_input = super::get_audio_input();
         get_audio_input(&audio_input)
     }

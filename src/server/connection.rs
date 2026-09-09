@@ -745,12 +745,12 @@ impl Connection {
                                             if conn.voice_calling || !conn.audio_enabled() {
                                                 s.write().unwrap().subscribe(
                                                     super::audio_service::NAME,
-                                                    conn.inner.clone(), conn.audio_enabled());
+                                                    conn.inner.clone(), conn.audio_subscription_enabled());
                                             }
                                         } else {
                                             s.write().unwrap().subscribe(
                                                 super::audio_service::NAME,
-                                                conn.inner.clone(), conn.audio_enabled());
+                                                conn.inner.clone(), conn.audio_subscription_enabled());
                                         }
                                     }
                                 }
@@ -2078,6 +2078,22 @@ impl Connection {
 
     fn audio_enabled(&self) -> bool {
         self.audio && !self.disable_audio
+    }
+
+    /// The custom macOS voice-input path is receive-only. During a voice call,
+    /// never subscribe this connection to the controlled device's audio input.
+    fn audio_subscription_enabled(&self) -> bool {
+        // The Norman macOS receiver is intentionally microphone-free.  Keep
+        // this guard independent of the controller's legacy `disable_audio`
+        // preference so an older phone build cannot re-enable Mac mic capture.
+        #[cfg(target_os = "macos")]
+        {
+            false
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.audio_enabled() && !self.voice_calling
+        }
     }
 
     #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
@@ -3525,7 +3541,11 @@ impl Connection {
                         _ => {}
                     },
                     Some(misc::Union::AudioFormat(format)) => {
-                        if !self.disable_audio {
+                        // Voice-call audio is the controller's microphone stream.
+                        // It must still be decoded when ordinary remote audio is
+                        // disabled; that preference protects the controlled Mac
+                        // microphone from being opened and sent upstream.
+                        if !self.disable_audio || self.voice_calling {
                             // Drop the audio sender previously.
                             drop(std::mem::replace(&mut self.audio_sender, None));
                             // A voice call carries the remote microphone. Keep ordinary
@@ -3542,9 +3562,8 @@ impl Connection {
                                     name
                                 );
                             }
-                            self.audio_sender = Some(start_audio_thread_with_output_device(
-                                output_device_name,
-                            ));
+                            self.audio_sender =
+                                Some(start_audio_thread_with_output_device(output_device_name));
                             self.audio_sender
                                 .as_ref()
                                 .map(|a| allow_err!(a.send(MediaData::AudioFormat(format))));
@@ -3637,7 +3656,9 @@ impl Connection {
                     _ => {}
                 },
                 Some(message::Union::AudioFrame(frame)) => {
-                    if !self.disable_audio {
+                    // Voice-call frames are the one-way phone-to-Mac input path and
+                    // are intentionally independent from the Mac-audio preference.
+                    if !self.disable_audio || self.voice_calling {
                         if let Some(sender) = &self.audio_sender {
                             allow_err!(sender.send(MediaData::AudioFrame(Box::new(frame))));
                         } else {
@@ -4381,9 +4402,14 @@ impl Connection {
         if let Some(ts) = self.voice_call_request_timestamp.take() {
             let msg = new_voice_call_response(ts.get(), accepted);
             if accepted {
+                #[cfg(not(target_os = "macos"))]
                 crate::audio_service::set_voice_call_input_device(
                     crate::get_default_sound_input(),
                     false,
+                );
+                #[cfg(target_os = "macos")]
+                log::info!(
+                    "Voice call accepted as one-way remote microphone input; controlled microphone capture remains disabled"
                 );
                 self.send_to_cm(Data::StartVoiceCall);
             } else {
@@ -4391,12 +4417,12 @@ impl Connection {
             }
             self.send(msg).await;
             self.voice_calling = accepted;
-            if self.is_authed_view_camera_conn() {
+            if self.is_authed_view_camera_conn() || self.is_authed_remote_conn() {
                 if let Some(s) = self.server.upgrade() {
                     s.write().unwrap().subscribe(
                         super::audio_service::NAME,
                         self.inner.clone(),
-                        self.audio_enabled() && accepted,
+                        self.audio_subscription_enabled(),
                     );
                 }
             }
@@ -4410,11 +4436,13 @@ impl Connection {
         // Notify the connection manager that the voice call has been closed.
         self.send_to_cm(Data::CloseVoiceCall("".to_owned()));
         self.voice_calling = false;
-        if self.is_authed_view_camera_conn() {
+        if self.is_authed_view_camera_conn() || self.is_authed_remote_conn() {
             if let Some(s) = self.server.upgrade() {
-                s.write()
-                    .unwrap()
-                    .subscribe(super::audio_service::NAME, self.inner.clone(), false);
+                s.write().unwrap().subscribe(
+                    super::audio_service::NAME,
+                    self.inner.clone(),
+                    self.audio_subscription_enabled(),
+                );
             }
         }
     }
@@ -4498,14 +4526,14 @@ impl Connection {
                             s.write().unwrap().subscribe(
                                 super::audio_service::NAME,
                                 self.inner.clone(),
-                                self.audio_enabled(),
+                                self.audio_subscription_enabled(),
                             );
                         }
                     } else {
                         s.write().unwrap().subscribe(
                             super::audio_service::NAME,
                             self.inner.clone(),
-                            self.audio_enabled(),
+                            self.audio_subscription_enabled(),
                         );
                     }
                 }
