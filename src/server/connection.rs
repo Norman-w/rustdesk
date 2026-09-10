@@ -3674,7 +3674,26 @@ impl Connection {
                             NonZeroI64::new(request.req_timestamp)
                                 .unwrap_or(NonZeroI64::new(get_time()).unwrap()),
                         );
-                        // Notify the connection manager.
+                        // A tray/headless server has no Flutter dialog that can
+                        // answer the incoming voice-call event. When the Norman
+                        // virtual-input route is explicitly configured, accept
+                        // it here so the phone does not wait for the 15s request
+                        // timeout. This is deliberately limited to the macOS
+                        // `--server` process and does not open the controlled
+                        // Mac's built-in microphone.
+                        #[cfg(target_os = "macos")]
+                        {
+                            let headless_server = std::env::args().any(|arg| arg == "--server");
+                            if headless_server && configured_remote_mic_output_device().is_some() {
+                                log::info!(
+                                    "Auto-accepting incoming voice call for the configured Norman virtual input"
+                                );
+                                self.handle_voice_call(true).await;
+                            } else {
+                                self.send_to_cm(Data::VoiceCallIncoming);
+                            }
+                        }
+                        #[cfg(not(target_os = "macos"))]
                         self.send_to_cm(Data::VoiceCallIncoming);
                     } else {
                         self.close_voice_call().await;

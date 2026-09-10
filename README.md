@@ -19,6 +19,12 @@ Chat with us: [Discord](https://discord.gg/nDceKgxnkV) | [Twitter](https://twitt
 
 Yet another remote desktop solution, written in Rust. Works out of the box with no configuration required. You have full control of your data, with no concerns about security. You can use our rendezvous/relay server, [set up your own](https://rustdesk.com/server), or [write your own rendezvous/relay server](https://github.com/rustdesk/rustdesk-server-demo).
 
+## Norman Remote Desktop fork
+
+This branch contains the Norman Remote Desktop macOS fork based on RustDesk 1.4.9. In addition to the upstream remote desktop features, it provides a headless `--cm-no-ui` connection manager for keeping full-screen apps and Spaces focused, plus an opt-in route for receiving the phone microphone through a Norman CoreAudio virtual input. The user-facing macOS app is `Norman Remote Desktop` (`NormanRemoteDesktop.app`); the internal Bundle ID remains `com.carriez.rustdesk` for upgrade compatibility.
+
+中文的 fork 特性、Mac mini 构建、受控端安装、虚拟声卡配置和安全边界说明见：[Norman fork 中文使用说明](docs/NORMAN_FORK_ZH-CN.md)。
+
 ![image](https://user-images.githubusercontent.com/71636191/171661982-430285f0-2e12-4b1d-9957-4a58e375304d.png)
 
 RustDesk welcomes contribution from everyone. See [CONTRIBUTING.md](docs/CONTRIBUTING.md) for help getting started.
@@ -179,4 +185,3 @@ Please ensure that you run these commands from the root of the RustDesk reposito
 ![File Transfer](https://github.com/rustdesk/rustdesk/assets/28412477/39511ad3-aa9a-4f8c-8947-1cce286a46ad)
 
 ![TCP Tunneling](https://github.com/rustdesk/rustdesk/assets/28412477/78e8708f-e87e-4570-8373-1360033ea6c5)
-

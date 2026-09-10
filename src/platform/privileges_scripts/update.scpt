@@ -2,7 +2,7 @@ on run {daemon_file, agent_file, user, cur_pid, source_dir}
 
   set agent_plist to "/Library/LaunchAgents/com.carriez.RustDesk_server.plist"
   set daemon_plist to "/Library/LaunchDaemons/com.carriez.RustDesk_service.plist"
-  set app_bundle to "/Applications/RustDesk.app"
+  set app_bundle to "/Applications/NormanRemoteDesktop.app"
 
   set check_source to "test -d " & quoted form of source_dir & " || exit 1;"
   set resolve_uid to "uid=$(id -u " & quoted form of user & " 2>/dev/null || true);"

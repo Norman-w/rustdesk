@@ -16,12 +16,12 @@
         <array>
         <string>/bin/sh</string>
         <string>-c</string>
-        <string>/Applications/RustDesk.app/Contents/MacOS/service</string>
+        <string>/Applications/NormanRemoteDesktop.app/Contents/MacOS/service</string>
         </array>
         <key>RunAtLoad</key>
         <true/>
         <key>WorkingDirectory</key>
-        <string>/Applications/RustDesk.app/Contents/MacOS/</string>
+        <string>/Applications/NormanRemoteDesktop.app/Contents/MacOS/</string>
         <key>StandardErrorPath</key>
         <string>/tmp/rustdesk_service.err</string>
         <key>StandardOutPath</key>
