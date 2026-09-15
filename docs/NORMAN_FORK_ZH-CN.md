@@ -45,8 +45,10 @@ git clone --recurse-submodules https://github.com/Norman-w/rustdesk.git
 cd rustdesk
 git checkout norman/remote-mic-1.4.9
 git submodule update --init --recursive
-./build.py --flutter --hwcodec --unix-file-copy-paste
+./build.py --flutter --unix-file-copy-paste
 ```
+
+默认构建不启用 `hwcodec`，这样生成的 macOS 应用不依赖构建机上的 Homebrew `libvmaf` 等运行时库，复制到另一台 Mac 后可以直接启动。只有在目标 Mac 已准备好完全匹配的硬件编解码运行库时，才增加 `--hwcodec`。
 
 正式构建完成后，产物应为：
 
