@@ -89,6 +89,7 @@ fn main() {
         #[cfg(target_os = "macos")]
         build_mac();
         println!("cargo:rustc-link-lib=framework=ApplicationServices");
+        println!("cargo:rustc-link-lib=framework=CoreAudio");
     }
     println!("cargo:rerun-if-changed=build.rs");
 }

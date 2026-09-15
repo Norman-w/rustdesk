@@ -29,6 +29,7 @@ use objc::{class, msg_send, sel, sel_impl};
 use scrap::{libc::c_void, quartz::ffi::*};
 use std::{
     collections::HashMap,
+    ffi::CString,
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -82,6 +83,24 @@ extern "C" {
     fn MacSetMode(display: u32, width: u32, height: u32, tryHiDPI: bool) -> BOOL;
     fn CGWarpMouseCursorPosition(newCursorPosition: CGPoint) -> CGError;
     fn CGAssociateMouseAndMouseCursorPosition(connected: BooleanT) -> CGError;
+    fn MacBeginRemoteMicRoute(requested_name: *const std::os::raw::c_char) -> bool;
+    fn MacEndRemoteMicRoute();
+}
+
+/// Temporarily make the configured Norman virtual input the macOS default input.
+pub fn begin_remote_mic_route(device_name: &str) -> bool {
+    let Ok(device_name) = CString::new(device_name) else {
+        log::warn!("Cannot route remote microphone: device name contains a NUL byte");
+        return false;
+    };
+    unsafe { MacBeginRemoteMicRoute(device_name.as_ptr()) }
+}
+
+/// Restore the macOS input that was active before the remote microphone session.
+pub fn end_remote_mic_route() {
+    unsafe {
+        MacEndRemoteMicRoute();
+    }
 }
 
 pub fn major_version() -> u32 {

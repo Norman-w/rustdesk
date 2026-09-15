@@ -364,6 +364,8 @@ pub struct Connection {
     from_switch: bool,
     voice_call_request_timestamp: Option<NonZeroI64>,
     voice_calling: bool,
+    #[cfg(target_os = "macos")]
+    remote_mic_route_active: bool,
     options_in_login: Option<OptionMessage>,
     #[cfg(not(any(target_os = "ios")))]
     pressed_modifiers: HashSet<rdev::Key>,
@@ -559,6 +561,8 @@ impl Connection {
             audio_sender: None,
             voice_call_request_timestamp: None,
             voice_calling: false,
+            #[cfg(target_os = "macos")]
+            remote_mic_route_active: false,
             options_in_login: None,
             #[cfg(not(any(target_os = "ios")))]
             pressed_modifiers: Default::default(),
@@ -4417,6 +4421,36 @@ impl Connection {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    fn begin_remote_mic_route(&mut self) {
+        if self.remote_mic_route_active {
+            return;
+        }
+        let Some(device_name) = configured_remote_mic_output_device() else {
+            log::debug!("Remote microphone route is not configured");
+            return;
+        };
+        if crate::platform::begin_remote_mic_route(&device_name) {
+            self.remote_mic_route_active = true;
+            log::info!("Remote microphone route enabled for '{}'", device_name);
+        } else {
+            log::warn!(
+                "Remote microphone route could not select macOS input device '{}'",
+                device_name
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn end_remote_mic_route(&mut self) {
+        if !self.remote_mic_route_active {
+            return;
+        }
+        crate::platform::end_remote_mic_route();
+        self.remote_mic_route_active = false;
+        log::info!("Remote microphone route ended");
+    }
+
     pub async fn handle_voice_call(&mut self, accepted: bool) {
         if let Some(ts) = self.voice_call_request_timestamp.take() {
             let msg = new_voice_call_response(ts.get(), accepted);
@@ -4427,9 +4461,12 @@ impl Connection {
                     false,
                 );
                 #[cfg(target_os = "macos")]
-                log::info!(
-                    "Voice call accepted as one-way remote microphone input; controlled microphone capture remains disabled"
-                );
+                {
+                    self.begin_remote_mic_route();
+                    log::info!(
+                        "Voice call accepted as one-way remote microphone input; controlled microphone capture remains disabled"
+                    );
+                }
                 self.send_to_cm(Data::StartVoiceCall);
             } else {
                 self.send_to_cm(Data::CloseVoiceCall("".to_owned()));
@@ -4451,6 +4488,8 @@ impl Connection {
     }
 
     pub async fn close_voice_call(&mut self) {
+        #[cfg(target_os = "macos")]
+        self.end_remote_mic_route();
         crate::audio_service::set_voice_call_input_device(None, true);
         // Notify the connection manager that the voice call has been closed.
         self.send_to_cm(Data::CloseVoiceCall("".to_owned()));
@@ -4858,6 +4897,10 @@ impl Connection {
         //
         // We can add a (Vec<conn_id>, input device) to avoid this.
         // But it's not necessary now and we have to consider two audio services(client, server).
+        // Restore the system input if the peer disappears without sending an
+        // explicit voice-call close message.
+        #[cfg(target_os = "macos")]
+        self.end_remote_mic_route();
         crate::audio_service::set_voice_call_input_device(None, true);
         log::info!("#{} Connection closed: {}", self.inner.id(), reason);
         if lock && self.lock_after_session_end && self.keyboard {
@@ -6331,6 +6374,9 @@ impl Default for PortableState {
 
 impl Drop for Connection {
     fn drop(&mut self) {
+        #[cfg(target_os = "macos")]
+        self.end_remote_mic_route();
+
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         self.release_pressed_modifiers();
 
