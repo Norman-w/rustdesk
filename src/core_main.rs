@@ -29,6 +29,19 @@ macro_rules! my_println{
 /// If it returns [`Some`], then the process will continue, and flutter gui will be started.
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn core_main() -> Option<Vec<String>> {
+    // Keep TCC inspection/repair a side-effect-free command-line path.  The
+    // CM helper calls --tcc-status periodically, so it must not initialize the
+    // server or start another UI instance just to read macOS permissions.
+    #[cfg(target_os = "macos")]
+    if let Some(command) = std::env::args().nth(1) {
+        if command == "--tcc-status" {
+            println!("{}", crate::platform::macos::tcc_status_json());
+            return None;
+        } else if command == "--repair-tcc" {
+            println!("{}", crate::platform::macos::repair_tcc_json());
+            return None;
+        }
+    }
     if !crate::common::global_init() {
         return None;
     }

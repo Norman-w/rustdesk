@@ -429,6 +429,29 @@ class _DesktopHomePageState extends State<DesktopHomePage>
     );
   }
 
+  bool _macTccReady() {
+    return bind.mainIsCanScreenRecording(prompt: false) &&
+        bind.mainIsProcessTrusted(prompt: false) &&
+        bind.mainIsCanInputMonitoring(prompt: false);
+  }
+
+  void _requestMacTccRepair() {
+    // Request one permission at a time. macOS owns TCC and deliberately does
+    // not allow an app to grant these permissions silently; the existing
+    // watcher will rebuild this card after the user confirms each page.
+    if (!bind.mainIsCanScreenRecording(prompt: false)) {
+      bind.mainIsCanScreenRecording(prompt: true);
+      watchIsCanScreenRecording = true;
+    } else if (!bind.mainIsProcessTrusted(prompt: false)) {
+      bind.mainIsProcessTrusted(prompt: true);
+      watchIsProcessTrust = true;
+    } else if (!bind.mainIsCanInputMonitoring(prompt: false)) {
+      bind.mainIsCanInputMonitoring(prompt: true);
+      watchIsInputMonitoring = true;
+    }
+    setState(() {});
+  }
+
   Widget buildHelpCards(String updateUrl) {
     if (!bind.isCustomClient() &&
         updateUrl.isNotEmpty &&
@@ -478,7 +501,12 @@ class _DesktopHomePageState extends State<DesktopHomePage>
       }
     } else if (isMacOS) {
       final isOutgoingOnly = bind.isOutgoingOnly();
-      if (!(isOutgoingOnly || bind.mainIsCanScreenRecording(prompt: false))) {
+      if (!isOutgoingOnly && !_macTccReady()) {
+        return buildInstallCard(
+            "macos_tcc_title", "macos_tcc_tip", "macos_tcc_repair", () {
+          _requestMacTccRepair();
+        }, help: 'Help', link: translate("doc_mac_permission"));
+      } else if (!(isOutgoingOnly || bind.mainIsCanScreenRecording(prompt: false))) {
         return buildInstallCard("Permissions", "config_screen", "Configure",
             () async {
           bind.mainIsCanScreenRecording(prompt: true);

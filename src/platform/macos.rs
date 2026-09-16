@@ -135,6 +135,75 @@ pub fn is_can_screen_recording(prompt: bool) -> bool {
     autoreleasepool(|| unsafe_is_can_screen_recording(prompt))
 }
 
+/// The three macOS permissions needed by an incoming remote-control session.
+///
+/// TCC grants belong to the currently signed executable.  Keeping this as a
+/// single status object lets the desktop UI, the installer, and the headless
+/// CM helper report the same answer after a rebuild or re-sign.
+#[derive(Clone, Copy, Debug)]
+pub struct TccStatus {
+    pub screen_recording: bool,
+    pub accessibility: bool,
+    pub input_monitoring: bool,
+}
+
+impl TccStatus {
+    pub fn all_granted(self) -> bool {
+        self.screen_recording && self.accessibility && self.input_monitoring
+    }
+
+    pub fn to_json(self) -> String {
+        format!(
+            "{{\"schemaVersion\":1,\"screenRecording\":{},\"accessibility\":{},\"inputMonitoring\":{},\"ready\":{}}}",
+            self.screen_recording,
+            self.accessibility,
+            self.input_monitoring,
+            self.all_granted(),
+        )
+    }
+}
+
+pub fn tcc_status() -> TccStatus {
+    TccStatus {
+        screen_recording: is_can_screen_recording(false),
+        accessibility: is_process_trusted(false),
+        input_monitoring: is_can_input_monitoring(false),
+    }
+}
+
+/// Return the current TCC state without changing permissions.
+pub fn tcc_status_json() -> String {
+    tcc_status().to_json()
+}
+
+/// Request the next missing permission through Apple's public APIs.
+///
+/// macOS intentionally does not allow an application to silently grant TCC.
+/// We request one item at a time so the user sees one unambiguous system page;
+/// the next invocation continues with the next missing item.
+pub fn repair_tcc_json() -> String {
+    let before = tcc_status();
+    let requested = if !before.screen_recording {
+        is_can_screen_recording(true);
+        "screenRecording"
+    } else if !before.accessibility {
+        is_process_trusted(true);
+        "accessibility"
+    } else if !before.input_monitoring {
+        is_can_input_monitoring(true);
+        "inputMonitoring"
+    } else {
+        "none"
+    };
+    let status = tcc_status();
+    format!(
+        "{{\"schemaVersion\":1,\"requested\":\"{}\",\"before\":{},\"status\":{}}}",
+        requested,
+        before.to_json(),
+        status.to_json(),
+    )
+}
+
 // macOS >= 10.15
 // https://stackoverflow.com/questions/56597221/detecting-screen-recording-settings-on-macos-catalina/
 // remove just one app from all the permissions: tccutil reset All com.carriez.rustdesk

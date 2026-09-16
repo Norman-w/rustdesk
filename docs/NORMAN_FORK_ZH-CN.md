@@ -13,6 +13,20 @@
 - 菜单栏应用在后台服务仍在工作时不会因为窗口生命周期而自动退出。
 - 当受控端使用无界面连接管理器时，不会再因为远程连接弹出一个短暂窗口而把 Codex、全屏终端或其他全屏应用切回桌面。
 
+### macOS TCC 检查和修复
+
+- 桌面端主界面会统一检查“屏幕录制”“辅助功能”和“输入监控”三项权限。
+- 缺少权限时可以点击“检查并修复”，应用只通过 Apple 公开 API 请求下一项权限；macOS 仍会要求电脑用户在系统设置中确认，应用不会修改私有 TCC 数据库，也不能静默授权。
+- 受控端可在终端运行 `--tcc-status` 查看状态，运行 `--repair-tcc` 请求下一项缺失权限：
+
+  ```sh
+  APP="/Applications/NormanRemoteDesktop.app/Contents/MacOS/NormanRemoteDesktop"
+  "$APP" --tcc-status
+  "$APP" --repair-tcc
+  ```
+
+- CM Helper 的心跳会同步三项权限状态；手机端发现权限未就绪时会明确提示可能黑屏，并引导用户回到受控端点击“检查并修复”。
+
 ### 手机麦克风输入
 
 - 远端语音通话流可以在 macOS 受控端被解码，并路由到用户明确选择的输出设备。
@@ -71,6 +85,7 @@ CM Helper 和虚拟声卡位于 Norman Remote Desktop 配套工程中，在已�
 - `--cm-no-ui` 连接管理 LaunchAgent；
 - `NormanRemoteMic.driver` CoreAudio HAL 插件；
 - 音频设备探测和显式路由配置脚本；
+- TCC 状态检查和修复脚本 `repair-tcc.sh`；
 - 可审计的虚拟声卡源代码、许可证和 RustDesk 路由补丁。
 
 ## 受控 Mac 安装和配置
@@ -78,7 +93,15 @@ CM Helper 和虚拟声卡位于 Norman Remote Desktop 配套工程中，在已�
 1. 退出旧版 RustDesk，再将 fork 应用安装到 `/Applications/NormanRemoteDesktop.app`。
 2. 首次运行时，按照 macOS 实际提示授予屏幕录制、辅助功能/输入监控等远程控制所需权限。macOS 不允许应用静默授予 TCC；本功能的默认输入切换不绕过 TCC。受控 RustDesk 不采集物理麦克风，因此不需要用 RustDesk 的麦克风权限替代 Codex 等目标应用自己的麦克风权限。
 3. 安装 CM Helper 包，并等待 CoreAudio 重新加载；必要时重新登录或重启 CoreAudio。
-4. 检查并选择 Norman 虚拟设备：
+4. 如果手机提示受控端权限未就绪，先在受控 Mac 主程序中点击“检查并修复”，或运行：
+
+   ```sh
+   HELPER="$HOME/Library/Application Support/NormanRemoteDesktop/cm-helper"
+   "$HELPER/repair-tcc.sh" repair
+   ```
+
+   按 macOS 系统设置逐项开启三项权限后，再回到手机重新检查。
+5. 检查并选择 Norman 虚拟设备：
 
    ```sh
    HELPER="$HOME/Library/Application Support/NormanRemoteDesktop/cm-helper"
@@ -88,8 +111,8 @@ CM Helper 和虚拟声卡位于 Norman Remote Desktop 配套工程中，在已�
    "$HELPER/remote-mic-config.sh" status
    ```
 
-5. 语音会话接通后，RustDesk 会把系统默认输入临时切到 Norman 手机麦克风，并在会话结束时恢复。若 Codex 或其他目标应用固定绑定了某个具体输入设备而不是跟随系统默认输入，仍需在该应用内手动选择 Norman 手机麦克风；这不属于 RustDesk 可以替换的 TCC 授权。
-6. 在手机 HAP 中连接到该 Mac；连接后显示麦克风对讲按钮，按住按钮开始说话。
+6. 语音会话接通后，RustDesk 会把系统默认输入临时切到 Norman 手机麦克风，并在会话结束时恢复。若 Codex 或其他目标应用固定绑定了某个具体输入设备而不是跟随系统默认输入，仍需在该应用内手动选择 Norman 手机麦克风；这不属于 RustDesk 可以替换的 TCC 授权。
+7. 在手机 HAP 中连接到该 Mac；连接后显示麦克风对讲按钮，按住按钮开始说话。
 
 普通远程桌面音频和手机麦克风输入是两条不同用途的路径。CM 可以处于 ready，而音频仍保持 disabled；只有明确选择 Norman 输出并启用手机端对讲时，手机音频才会进入虚拟设备。
 
@@ -105,6 +128,10 @@ CM Helper 和虚拟声卡位于 Norman Remote Desktop 配套工程中，在已�
 - `unavailable`：之前选择的设备当前不存在或不可用。
 
 如果 Helper 已安装但手机仍提示“受控端虚拟麦克风未加载”，先运行 `status`，确认 CoreAudio 能看到 `Norman 手机麦克风`，再重启 Helper；不能仅凭目录存在就判断组件 ready。
+
+TCC 状态另行写入 `tcc-status.json`，并以 `tcc-state-ready`、
+`tcc-state-needs-attention` 或 `tcc-state-unknown` 标记。Helper ready 不代表
+TCC ready；两者都会在手机端分别显示。
 
 ## 升级和身份兼容
 
