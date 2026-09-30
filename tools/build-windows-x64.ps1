@@ -7,6 +7,11 @@ if (-not $IsWindows -or [System.Runtime.InteropServices.RuntimeInformation]::OSA
 
 $root = Split-Path $PSScriptRoot -Parent
 Set-Location $root
+foreach ($required in @('LICENCE', 'docs/WINDOWS_X64_ZH-CN.md',
+    'libs/portable/requirements.txt', 'libs/portable/generate.py',
+    'res/msi/preprocess.py', 'res/msi/msi.sln')) {
+    if (-not (Test-Path $required -PathType Leaf)) { throw "Missing packaging source: $required" }
+}
 $version = [regex]::Match((Get-Content Cargo.toml -Raw), '(?m)^version = "([^"]+)"').Groups[1].Value
 if (-not $version -or (Get-Content flutter/pubspec.yaml -Raw) -notmatch "(?m)^version: $([regex]::Escape($version))\+") {
     throw 'Rust and Flutter versions must agree.'
@@ -62,7 +67,7 @@ if ($reportedVersion -ne $version) { throw "Executable reports $reportedVersion,
 $buildDate = Read-AppOutput "$bundle/rustdesk.exe" '--build-date'
 
 # Keep upstream Windows installation identity until a separate migration is validated.
-Copy-Item LICENSE "$bundle/LICENSE"
+Copy-Item LICENCE "$bundle/LICENCE"
 Copy-Item docs/WINDOWS_X64_ZH-CN.md "$bundle/README-Norman.md"
 Compress-Archive "$bundle/*" "$out/$prefix-portable.zip"
 python -m pip install -r libs/portable/requirements.txt

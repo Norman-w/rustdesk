@@ -32,11 +32,21 @@ test('package versions agree across Rust, Flutter and the portable wrapper', () 
 test('packages include dependencies and preserve upstream license and identity', () => {
   assert.match(build, /cargo build --locked --package dylib_virtual_display --release/);
   assert.match(build, /Copy-Item target\/release\/deps\/dylib_virtual_display\.dll \$bundle/);
-  assert.match(build, /Copy-Item LICENSE "\$bundle\/LICENSE"/);
+  assert.match(build, /Copy-Item LICENCE "\$bundle\/LICENCE"/);
   assert.match(build, /Compress-Archive "\$bundle\/\*"/);
   assert.match(build, /python generate\.py/);
   assert.match(build, /python preprocess\.py --arp/);
   assert.doesNotMatch(build, /--app-name|msiexec|\/Applications\//);
+});
+
+test('packaging inputs exist and are checked before compilation', () => {
+  for (const file of ['LICENCE', 'docs/WINDOWS_X64_ZH-CN.md',
+    'libs/portable/requirements.txt', 'libs/portable/generate.py',
+    'res/msi/preprocess.py', 'res/msi/msi.sln']) {
+    assert.ok(fs.statSync(path.join(root, file)).isFile(), file);
+    assert.ok(build.includes(`'${file}'`), file);
+  }
+  assert.ok(build.indexOf('Missing packaging source:') < build.indexOf('cargo build'));
 });
 
 test('validation checks architecture, DLL loading, MSI version and checksums without installing', () => {

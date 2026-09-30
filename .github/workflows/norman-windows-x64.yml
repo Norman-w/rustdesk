@@ -136,3 +136,13 @@ jobs:
           if-no-files-found: error
           retention-days: 30
           path: output/windows-x64/*
+      - name: Preserve build outputs for packaging failure diagnosis
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: NormanRemoteDesktop-Windows-incomplete
+          if-no-files-found: ignore
+          retention-days: 7
+          path: |
+            output/windows-bundle/
+            output/windows-x64/
