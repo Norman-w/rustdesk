@@ -12,6 +12,7 @@ test('Windows build is isolated, read-only on GitHub, and software-codec only', 
   assert.match(workflow, /branches: \[codex\/windows-x64-release\]/);
   assert.match(workflow, /runs-on: windows-2022/);
   assert.match(workflow, /contents: read/);
+  assert.match(workflow, /components: rustfmt/);
   assert.doesNotMatch(workflow, /secrets\.|contents: write|action-gh-release|--hwcodec|--vram/);
   assert.match(workflow, /install --classic .*aom libjpeg-turbo libvpx libyuv opus/);
   assert.doesNotMatch(workflow, /libvmaf|ffmpeg/);
