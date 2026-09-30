@@ -2145,6 +2145,22 @@ pub fn main_start_service() {
         crate::rendezvous_mediator::reset_needs_deploy_notification();
         crate::rendezvous_mediator::RendezvousMediator::restart();
     }
+    #[cfg(target_os = "macos")]
+    {
+        config::Config::set_option("stop-service".into(), "".into());
+        std::thread::spawn(|| crate::start_server(false, false));
+    }
+}
+
+pub fn main_relaunch_app() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        return crate::platform::macos::relaunch();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
 }
 
 pub fn main_update_temporary_password() {
@@ -2323,6 +2339,67 @@ pub fn main_is_installed_lower_version() -> SyncReturn<bool> {
 
 pub fn main_is_installed_daemon(prompt: bool) -> SyncReturn<bool> {
     SyncReturn(is_installed_daemon(prompt))
+}
+
+pub fn main_is_norman_cm_helper_installed() -> SyncReturn<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        return SyncReturn(crate::platform::macos::is_norman_cm_helper_installed());
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        SyncReturn(false)
+    }
+}
+
+pub fn main_is_norman_virtual_mic_installed() -> SyncReturn<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        return SyncReturn(crate::platform::macos::is_norman_virtual_mic_installed());
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        SyncReturn(false)
+    }
+}
+
+pub fn main_get_tcc_status_json() -> SyncReturn<String> {
+    #[cfg(target_os = "macos")]
+    {
+        return SyncReturn(crate::platform::macos::tcc_status_json());
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        SyncReturn(
+            r#"{"schemaVersion":1,"screenRecording":false,"accessibility":false,"inputMonitoring":false,"ready":false}"#
+                .to_owned(),
+        )
+    }
+}
+
+pub fn main_repair_tcc_json() -> SyncReturn<String> {
+    #[cfg(target_os = "macos")]
+    {
+        return SyncReturn(crate::platform::macos::repair_tcc_json());
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        SyncReturn(
+            r#"{"schemaVersion":1,"requested":"unsupported","status":{"schemaVersion":1,"screenRecording":false,"accessibility":false,"inputMonitoring":false,"ready":false}}"#
+                .to_owned(),
+        )
+    }
+}
+
+pub fn main_open_norman_cm_helper_installer() -> SyncReturn<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        return SyncReturn(crate::platform::macos::open_norman_cm_helper_installer());
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        SyncReturn(false)
+    }
 }
 
 pub fn main_is_process_trusted(prompt: bool) -> SyncReturn<bool> {

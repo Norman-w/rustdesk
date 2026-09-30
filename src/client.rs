@@ -1443,10 +1443,20 @@ impl AudioHandler {
     pub fn handle_format(&mut self, f: AudioFormat) {
         match AudioDecoder::new(f.sample_rate, if f.channels > 1 { Stereo } else { Mono }) {
             Ok(d) => {
+                #[cfg(not(target_os = "linux"))]
+                {
+                    // A new voice call must own a fresh CoreAudio stream. The
+                    // previous call can otherwise keep writing silence into
+                    // the virtual device after reconnect.
+                    drop(self.audio_stream.take());
+                    *self.ready.lock().unwrap() = false;
+                }
                 let buffer = vec![0.; f.sample_rate as usize * f.channels as usize];
                 self.audio_decoder = Some((d, buffer));
                 self.channels = f.channels as _;
-                allow_err!(self.start_audio(f));
+                if let Err(err) = self.start_audio(f) {
+                    log::error!("Failed to start remote audio output: {err:#}");
+                }
             }
             Err(err) => {
                 log::error!("Failed to create audio decoder: {}", err);

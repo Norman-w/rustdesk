@@ -48,6 +48,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
   var watchIsProcessTrust = false;
   var watchIsInputMonitoring = false;
   var watchIsCanRecordAudio = false;
+  var macTccRelaunchRequested = false;
   Timer? _updateTimer;
   bool isCardClosed = false;
 
@@ -435,21 +436,18 @@ class _DesktopHomePageState extends State<DesktopHomePage>
         bind.mainIsCanInputMonitoring(prompt: false);
   }
 
-  void _requestMacTccRepair() {
-    // Request one permission at a time. macOS owns TCC and deliberately does
-    // not allow an app to grant these permissions silently; the existing
-    // watcher will rebuild this card after the user confirms each page.
-    if (!bind.mainIsCanScreenRecording(prompt: false)) {
-      bind.mainIsCanScreenRecording(prompt: true);
-      watchIsCanScreenRecording = true;
-    } else if (!bind.mainIsProcessTrusted(prompt: false)) {
-      bind.mainIsProcessTrusted(prompt: true);
-      watchIsProcessTrust = true;
-    } else if (!bind.mainIsCanInputMonitoring(prompt: false)) {
-      bind.mainIsCanInputMonitoring(prompt: true);
-      watchIsInputMonitoring = true;
+  void _recoverMacServiceIfTccReady({bool relaunch = false}) {
+    if (isMacOS && !bind.isOutgoingOnly() && _macTccReady()) {
+      bind.mainStartService();
+      if (relaunch && !macTccRelaunchRequested) {
+        macTccRelaunchRequested = true;
+        bind.mainRelaunchApp();
+      }
     }
-    setState(() {});
+  }
+
+  void _requestMacTccRepair() {
+    DesktopSettingPage.switch2page(SettingsTabKey.normanGuide);
   }
 
   Widget buildHelpCards(String updateUrl) {
@@ -501,11 +499,13 @@ class _DesktopHomePageState extends State<DesktopHomePage>
       }
     } else if (isMacOS) {
       final isOutgoingOnly = bind.isOutgoingOnly();
-      if (!isOutgoingOnly && !_macTccReady()) {
+      if (!isOutgoingOnly &&
+          (!_macTccReady() || !bind.mainIsNormanCmHelperInstalled())) {
         return buildInstallCard(
-            "macos_tcc_title", "macos_tcc_tip", "macos_tcc_repair", () {
-          _requestMacTccRepair();
-        }, help: 'Help', link: translate("doc_mac_permission"));
+            "macos_setup_guide_title", "macos_setup_guide_summary",
+            "macos_setup_guide_open", () {
+          DesktopSettingPage.switch2page(SettingsTabKey.normanGuide);
+        });
       } else if (!(isOutgoingOnly || bind.mainIsCanScreenRecording(prompt: false))) {
         return buildInstallCard("Permissions", "config_screen", "Configure",
             () async {
@@ -740,22 +740,21 @@ class _DesktopHomePageState extends State<DesktopHomePage>
       if (watchIsCanScreenRecording) {
         if (bind.mainIsCanScreenRecording(prompt: false)) {
           watchIsCanScreenRecording = false;
+          _recoverMacServiceIfTccReady(relaunch: true);
           setState(() {});
         }
       }
       if (watchIsProcessTrust) {
         if (bind.mainIsProcessTrusted(prompt: false)) {
           watchIsProcessTrust = false;
+          _recoverMacServiceIfTccReady(relaunch: true);
           setState(() {});
         }
       }
       if (watchIsInputMonitoring) {
         if (bind.mainIsCanInputMonitoring(prompt: false)) {
           watchIsInputMonitoring = false;
-          // Do not notify for now.
-          // Monitoring may not take effect until the process is restarted.
-          // rustDeskWinManager.call(
-          //     WindowType.RemoteDesktop, kWindowDisableGrabKeyboard, '');
+          _recoverMacServiceIfTccReady(relaunch: true);
           setState(() {});
         }
       }

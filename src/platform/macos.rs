@@ -85,6 +85,8 @@ extern "C" {
     fn CGAssociateMouseAndMouseCursorPosition(connected: BooleanT) -> CGError;
     fn MacBeginRemoteMicRoute(requested_name: *const std::os::raw::c_char) -> bool;
     fn MacEndRemoteMicRoute();
+    fn MacBeginRemoteAudioRoute(requested_name: *const std::os::raw::c_char) -> bool;
+    fn MacEndRemoteAudioRoute();
 }
 
 /// Temporarily make the configured Norman virtual input the macOS default input.
@@ -103,8 +105,30 @@ pub fn end_remote_mic_route() {
     }
 }
 
+/// Temporarily make the Norman virtual output the macOS default output.
+pub fn begin_remote_audio_route(device_name: &str) -> bool {
+    let Ok(device_name) = CString::new(device_name) else {
+        log::warn!("Cannot route remote system audio: device name contains a NUL byte");
+        return false;
+    };
+    unsafe { MacBeginRemoteAudioRoute(device_name.as_ptr()) }
+}
+
+/// Restore the macOS outputs that were active before the remote audio session.
+pub fn end_remote_audio_route() {
+    unsafe {
+        MacEndRemoteAudioRoute();
+    }
+}
+
 pub fn major_version() -> u32 {
     unsafe { majorVersion() }
+}
+
+#[inline]
+fn needs_legacy_server_agent() -> bool {
+    // macOS 26 attributes screen capture to launchd when --server is launched by a LaunchAgent.
+    major_version() < 26
 }
 
 pub fn is_process_trusted(prompt: bool) -> bool {
@@ -277,13 +301,14 @@ pub fn install_service() -> bool {
 pub fn is_installed_daemon(prompt: bool) -> bool {
     let daemon = format!("{}_service.plist", crate::get_full_name());
     let agent = format!("{}_server.plist", crate::get_full_name());
+    let daemon_plist_file = format!("/Library/LaunchDaemons/{}", daemon);
     let agent_plist_file = format!("/Library/LaunchAgents/{}", agent);
     if !prompt {
         // in macos 13, there is new way to check if they are running or enabled, https://developer.apple.com/documentation/servicemanagement/updating-helper-executables-from-earlier-versions-of-macos#Respond-to-changes-in-System-Settings
-        if !std::path::Path::new(&format!("/Library/LaunchDaemons/{}", daemon)).exists() {
+        if !std::path::Path::new(&daemon_plist_file).exists() {
             return false;
         }
-        if !std::path::Path::new(&agent_plist_file).exists() {
+        if needs_legacy_server_agent() && !std::path::Path::new(&agent_plist_file).exists() {
             return false;
         }
         return true;
@@ -303,11 +328,16 @@ pub fn is_installed_daemon(prompt: bool) -> bool {
         return false;
     };
 
-    let Some(agent_plist) = PRIVILEGES_SCRIPTS_DIR.get_file("agent.plist") else {
-        return false;
-    };
-    let Some(agent_plist_body) = agent_plist.contents_utf8().map(correct_app_name) else {
-        return false;
+    let agent_plist_body = if needs_legacy_server_agent() {
+        let Some(agent_plist) = PRIVILEGES_SCRIPTS_DIR.get_file("agent.plist") else {
+            return false;
+        };
+        let Some(agent_plist_body) = agent_plist.contents_utf8().map(correct_app_name) else {
+            return false;
+        };
+        agent_plist_body
+    } else {
+        String::new()
     };
 
     std::thread::spawn(move || {
@@ -323,9 +353,17 @@ pub fn is_installed_daemon(prompt: bool) -> bool {
                 log::error!("run osascript failed: {}", e);
             }
             _ => {
-                let installed = std::path::Path::new(&agent_plist_file).exists();
-                log::info!("Agent file {} installed: {}", agent_plist_file, installed);
-                if installed {
+                let daemon_installed = std::path::Path::new(&daemon_plist_file).exists();
+                let agent_installed = !needs_legacy_server_agent()
+                    || std::path::Path::new(&agent_plist_file).exists();
+                log::info!(
+                    "Daemon file {} installed: {}; agent file {} installed: {}",
+                    daemon_plist_file,
+                    daemon_installed,
+                    agent_plist_file,
+                    agent_installed
+                );
+                if needs_legacy_server_agent() && agent_installed {
                     log::info!("launch server");
                     std::process::Command::new("launchctl")
                         .args(&["load", "-w", &agent_plist_file])
@@ -336,6 +374,164 @@ pub fn is_installed_daemon(prompt: bool) -> bool {
         }
     });
     false
+}
+
+fn norman_plist_raw_value(path: &Path, key: &str) -> Option<String> {
+    Command::new("/usr/bin/plutil")
+        .args(["-extract", key, "raw", "-o", "-"])
+        .arg(path)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn norman_probe_reports_duplex_input(probe: &Path) -> bool {
+    let Ok(output) = Command::new(probe)
+        .args(["--check-output", "Norman 手机麦克风"])
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let has_positive_field = |name: &str| {
+        text.split_whitespace().any(|field| {
+            field
+                .strip_prefix(&format!("{}=", name))
+                .and_then(|value| value.parse::<u32>().ok())
+                .is_some_and(|value| value > 0)
+        })
+    };
+    text.contains("found=1")
+        && has_positive_field("input_channels")
+        && has_positive_field("output_channels")
+}
+
+fn refresh_norman_audio_markers(helper_root: &Path) {
+    let probe = helper_root.join("bin/norman-remote-mic-device-probe");
+    let config = helper_root.join("audio-config.plist");
+    let driver = Path::new("/Library/Audio/Plug-Ins/HAL/NormanRemoteMic.driver");
+    let driver_present = driver.join("Contents/Info.plist").is_file()
+        && driver.join("Contents/MacOS/NormanRemoteMic").is_file();
+    let virtual_input_state = if !driver_present {
+        "missing"
+    } else if probe.is_file() && norman_probe_reports_duplex_input(&probe) {
+        "available"
+    } else {
+        "pending-reload"
+    };
+
+    let enabled = norman_plist_raw_value(&config, "enabled").as_deref() == Some("true");
+    let selected_device = norman_plist_raw_value(&config, "outputDeviceName");
+    let loopback_verified = norman_plist_raw_value(&config, "loopbackVerified").as_deref()
+        == Some("true");
+    let audio_state = if !enabled {
+        "disabled"
+    } else if selected_device.as_deref() != Some("Norman 手机麦克风") || !loopback_verified {
+        "not-configured"
+    } else if virtual_input_state != "available" {
+        "unavailable"
+    } else {
+        "ready"
+    };
+
+    let Ok(entries) = std::fs::read_dir(helper_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("audio-state-") || name.starts_with("virtual-input-") {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    let _ = std::fs::write(helper_root.join(format!("audio-state-{}", audio_state)), b"");
+    let _ = std::fs::write(
+        helper_root.join(format!("virtual-input-{}", virtual_input_state)),
+        b"",
+    );
+}
+
+pub fn is_norman_cm_helper_installed() -> bool {
+    let home = std::env::var("HOME").unwrap_or_default();
+    if home.is_empty() {
+        return false;
+    }
+    let helper_root =
+        Path::new(&home).join("Library/Application Support/NormanRemoteDesktop/cm-helper");
+    let launch_agent = Path::new(&home)
+        .join("Library/LaunchAgents/com.norman.remotedesktop-cm-no-ui.plist");
+    let driver = Path::new("/Library/Audio/Plug-Ins/HAL/NormanRemoteMic.driver")
+        .join("Contents/MacOS/NormanRemoteMic");
+    let audio_driver = Path::new("/Library/Audio/Plug-Ins/HAL/NormanRemoteAudio.driver")
+        .join("Contents/MacOS/NormanRemoteAudio");
+    let app_managed = helper_root.join("app-managed.marker").is_file()
+        && helper_root.join("manifest.json").is_file()
+        && helper_root.join("audio-config.plist").is_file()
+        && helper_root
+            .join("bin/norman-remote-mic-device-probe")
+            .is_file()
+        && driver.is_file()
+        && audio_driver.is_file();
+    if app_managed {
+        refresh_norman_audio_markers(&helper_root);
+        return true;
+    }
+    helper_root.join("run-cm-helper.sh").is_file()
+        && helper_root
+            .join("bin/norman-remote-mic-device-probe")
+            .is_file()
+        && launch_agent.is_file()
+        && driver.is_file()
+        && audio_driver.is_file()
+}
+
+pub fn is_norman_virtual_mic_installed() -> bool {
+    let driver = Path::new("/Library/Audio/Plug-Ins/HAL/NormanRemoteMic.driver");
+    let info = driver.join("Contents/Info.plist");
+    let executable = driver.join("Contents/MacOS/NormanRemoteMic");
+    if !info.is_file() || !executable.is_file() {
+        return false;
+    }
+    let identifier = Command::new("/usr/libexec/PlistBuddy")
+        .args(["-c", "Print :CFBundleIdentifier"])
+        .arg(&info)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
+    identifier.as_deref() == Some("com.norman.remotedesktop.virtual-mic")
+}
+
+pub fn open_norman_cm_helper_installer() -> bool {
+    let Ok(cmd) = std::env::current_exe() else {
+        log::error!("Failed to locate current executable for CM Helper installer");
+        return false;
+    };
+    let Some(resources_dir) = cmd
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.join("Resources"))
+    else {
+        log::error!("Failed to locate app Resources directory: {:?}", cmd);
+        return false;
+    };
+    let pkg = resources_dir.join("NormanRemoteDesktop-CMHelper-1.3.0.pkg");
+    if !pkg.is_file() {
+        log::error!("Bundled CM Helper installer is missing: {:?}", pkg);
+        return false;
+    }
+    match Command::new("open").arg(&pkg).spawn() {
+        Ok(_) => true,
+        Err(e) => {
+            log::error!("Failed to open bundled CM Helper installer {:?}: {}", pkg, e);
+            false
+        }
+    }
 }
 
 fn update_daemon_agent(agent_plist_file: String, update_source_dir: String, sync: bool) {
@@ -353,11 +549,16 @@ fn update_daemon_agent(agent_plist_file: String, update_source_dir: String, sync
     let Some(daemon_plist_body) = daemon_plist.contents_utf8().map(correct_app_name) else {
         return;
     };
-    let Some(agent_plist) = PRIVILEGES_SCRIPTS_DIR.get_file("agent.plist") else {
-        return;
-    };
-    let Some(agent_plist_body) = agent_plist.contents_utf8().map(correct_app_name) else {
-        return;
+    let agent_plist_body = if needs_legacy_server_agent() {
+        let Some(agent_plist) = PRIVILEGES_SCRIPTS_DIR.get_file("agent.plist") else {
+            return;
+        };
+        let Some(agent_plist_body) = agent_plist.contents_utf8().map(correct_app_name) else {
+            return;
+        };
+        agent_plist_body
+    } else {
+        String::new()
     };
 
     let func = move || {
@@ -903,6 +1104,36 @@ pub fn quit_gui() {
     unsafe {
         let () = msg_send!(NSApp(), terminate: nil);
     };
+}
+
+pub fn relaunch() -> bool {
+    let Ok(cmd) = std::env::current_exe() else {
+        log::error!("Failed to locate current executable for relaunch");
+        return false;
+    };
+    let Some(app_dir) = cmd
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent())
+        .map(|p| p.to_path_buf())
+    else {
+        log::error!("Failed to locate app bundle for relaunch: {:?}", cmd);
+        return false;
+    };
+    if Command::new("open")
+        .arg("-n")
+        .arg(&app_dir)
+        .spawn()
+        .is_err()
+    {
+        log::error!("Failed to relaunch app bundle: {:?}", app_dir);
+        return false;
+    }
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        std::process::exit(0);
+    });
+    true
 }
 
 #[inline]

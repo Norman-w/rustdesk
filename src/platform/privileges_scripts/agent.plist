@@ -3,10 +3,10 @@
 <plist version="1.0">
     <dict>
         <key>Label</key>
-        <string>com.carriez.RustDesk_server</string>
+        <string>com.carriez.NormanRemoteDesktop_server</string>
 
 	<key>AssociatedBundleIdentifiers</key>
-	<string>com.carriez.rustdesk</string>
+	<string>com.carriez.NormanRemoteDesktop</string>
     
         <key>LimitLoadToSessionType</key>
         <array>
@@ -26,7 +26,7 @@
         <true />
         <key>ProgramArguments</key>
         <array>
-            <string>/Applications/NormanRemoteDesktop.app/Contents/MacOS/RustDesk</string>
+            <string>/Applications/NormanRemoteDesktop.app/Contents/MacOS/NormanRemoteDesktop</string>
             <string>--server</string>
         </array>
         <key>WorkingDirectory</key>

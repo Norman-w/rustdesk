@@ -1,147 +1,105 @@
 # Norman Remote Desktop fork 使用说明
 
-本分支是基于 RustDesk 1.4.9 的 Norman Remote Desktop fork。它保留 RustDesk 的远程桌面协议和兼容性，同时加入 Norman 项目所需的 macOS 全屏/Space 焦点保护，以及可选的手机麦克风输入链路。
+本仓库是 Norman Remote Desktop 电脑端的唯一源码归属，基于 RustDesk 1.4.9。
+当前归档版本与已分发的 macOS 1.4.10 对齐；仓库整理不代表重新发布或设备验收。
 
-这不是 RustDesk 官方发布包。构建、签名、安装和升级时，应把它当作 Norman Remote Desktop 的独立发行物；RustDesk 的版权、许可证和上游归属仍然保留。
+## 仓库边界
 
-## Fork 特性
+- 本仓库：RustDesk 电脑端、macOS 原生实现和 Flutter 配置向导、HAL 虚拟音频设备、安装和签名工具。
+- [鸿蒙仓库](https://github.com/Norman-w/NormanRemoteDesktop-HarmonyOS)：手机 UI、画面渲染、输入、手机麦克风采集和协议交互。
+- 两端通过协议协作，不在鸿蒙构建时修改或编译电脑端源码。
+- 不再提供构建时注入功能的 RustDesk 补丁。临时 Xcode 构建目录只存放正式源码副本和生成文件。
 
-### macOS 全屏和 Space 焦点保护
+## 电脑端功能
 
-- 支持以 `--cm-no-ui` 启动无界面的连接管理器。
-- 连接管理在后台运行时不会为了显示连接窗口而抢占当前 Space 或全屏应用。
-- 菜单栏应用在后台服务仍在工作时不会因为窗口生命周期而自动退出。
-- 当受控端使用无界面连接管理器时，不会再因为远程连接弹出一个短暂窗口而把 Codex、全屏终端或其他全屏应用切回桌面。
+### 配置向导与权限
 
-### macOS TCC 检查和修复
+首页缺少权限或音频组件时打开 macOS 配置向导；设置中也有独立入口。
+向导展示屏幕录制、辅助功能、输入监控和虚拟麦克风状态，先展示步骤，再请求下一项权限。
+授权由 Norman Remote Desktop 主程序负责，组件安装器不请求 TCC 权限。
+权限通过公开 API 检查和请求，用户仍须在系统设置中确认，不修改私有权限数据库。
 
-- 桌面端主界面会统一检查“屏幕录制”“辅助功能”和“输入监控”三项权限。
-- 缺少权限时可以点击“检查并修复”，应用只通过 Apple 公开 API 请求下一项权限；macOS 仍会要求电脑用户在系统设置中确认，应用不会修改私有 TCC 数据库，也不能静默授权。
-- 受控端可在终端运行 `--tcc-status` 查看状态，运行 `--repair-tcc` 请求下一项缺失权限：
+诊断入口是主程序的 `--tcc-status` 和 `--repair-tcc`。
+构建和分发校验只调用只读的状态接口，不自动请求授权、重启应用或验证远端连接。
 
-  ```sh
-  APP="/Applications/NormanRemoteDesktop.app/Contents/MacOS/NormanRemoteDesktop"
-  "$APP" --tcc-status
-  "$APP" --repair-tcc
-  ```
+### 连接管理与全屏保护
 
-- CM Helper 的心跳会同步三项权限状态；手机端发现权限未就绪时会明确提示可能黑屏，并引导用户回到受控端点击“检查并修复”。
+沿用 RustDesk 的应用、service、server、CM 分工，不增加另一个常驻主程序。
+设置提供“允许会话信息打断全屏 Space”。点击批准仍需要用户确认，不把隐藏连接窗口当作免认证。
+macOS 无界面连接管理和安装服务兼容逻辑均在本仓库，不通过单独的 CM LaunchAgent 补丁提供。
+历史包名 `CMHelper` 为兼容旧安装记录保留，当前组件安装包不启动一个独立 CM 服务。
 
-### 手机麦克风输入
+### 手机麦克风与系统声音
 
-- 远端语音通话流可以在 macOS 受控端被解码，并路由到用户明确选择的输出设备。
-- Norman 的 CoreAudio 虚拟设备 `Norman 手机麦克风` 将这一路音频提供给 Codex 或其他能够选择输入设备的应用。
-- 音频路由是显式可选的，默认关闭；语音会话接通后，临时把 macOS 的系统默认输入切到已配置的 Norman 虚拟输入。
-- 松开手机上的按住说话不会恢复设备；明确结束语音会话、远端断线或连接对象销毁时，恢复会话开始前保存的默认输入设备。
-- 这条链路不会录制或上传受控端的物理麦克风；它只把已接收的手机音频提供给使用系统默认输入的目标应用。
-- 手机端使用按住说话；连接确认成功和首个音频包发送成功分别提供触觉反馈。
+- 手机音频在已接受的语音会话中解码并写入 `Norman 手机麦克风` 的输出端，其他应用从同一设备的输入端读取。
+- 会话使用虚拟输入时保存原默认输入，结束或断线后恢复；重新通话会释放旧音频流。
+- “电脑扬声器和手机”使用 ScreenCaptureKit 回环，不改变电脑当前输出设备。
+- “Norman Remote Audio 虚拟输出”在远程音频订阅期间切换默认输出，结束后恢复。
+- 两个 HAL 设备使用独立缓冲区，不把手机声音和系统回传混在一起。
+- 以上通路不采集受控 Mac 的物理麦克风。应用若固定选择了设备，仍以该应用自己的设置为准。
 
-## 运行时组件
+## 构建与打包
 
-完整体验需要手机端一个应用和受控 Mac 端两个组件：
+需要完整 Xcode、Rust、Flutter 3.24.5、CocoaPods、项目所需原生音视频依赖，以及
+`flutter_rust_bridge_codegen 1.80.1` 和 `cargo-expand`。
+先初始化本仓库子模块；不需要鸿蒙仓库，也不需要已安装的 NormanRemoteDesktop.app。
 
-| 位置 | 组件 | 作用 |
-| --- | --- | --- |
-| HarmonyOS 手机 | `Norman Remote Desktop` HAP（包名 `com.norman.remotedesktop`） | 连接远程设备、显示画面、发送输入和可选的手机麦克风音频 |
-| 受控 Mac | `NormanRemoteDesktop.app` | Norman fork 的 RustDesk 桌面程序，负责远程桌面会话和音频接收 |
-| 受控 Mac | `NormanRemoteDesktop-CMHelper-*.pkg` | 安装 `--cm-no-ui` 后台管理、LaunchAgent 和 `Norman 手机麦克风` CoreAudio HAL 插件 |
-
-CM Helper 不是手机插件，也不是第二个 RustDesk 主程序。它是受控 Mac 上的配套组件；Mac mini 只负责构建和签名，不需要作为运行时组件安装。
-
-## 构建
-
-### macOS RustDesk fork
-
-建议在配有完整 Rust、Flutter、Xcode 和音视频依赖的 Mac mini 上构建：
+在本仓库根目录运行：
 
 ```sh
-git clone --recurse-submodules https://github.com/Norman-w/rustdesk.git
-cd rustdesk
-git checkout norman/remote-mic-1.4.9
+export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
 git submodule update --init --recursive
-./build.py --flutter --unix-file-copy-paste
+# Flutter 不在 PATH 时，设置 NORMAN_FLUTTER_BIN=/path/to/flutter/bin
+./tools/build-macos-app.sh
+./tools/build-rustdesk-cm-helper-pkg.sh
+./tools/package-macos-distribution.sh
+./tools/verify-macos-distribution.sh
 ```
 
-默认构建不启用 `hwcodec`，这样生成的 macOS 应用不依赖构建机上的 Homebrew `libvmaf` 等运行时库，复制到另一台 Mac 后可以直接启动。只有在目标 Mac 已准备好完全匹配的硬件编解码运行库时，才增加 `--hwcodec`。
+默认输出到本仓库 `output/`，包括 App、音频组件 PKG、主应用 PKG 和 DMG。
+只构建 HAL 时运行 `tools/mac-remote-mic/build-norman-remote-mic-driver.sh`。
+这些构建命令不会安装、结束现有进程或替换 Applications 中的应用。
 
-正式构建完成后，产物应为：
+应用构建每次从 `src/flutter_ffi.rs` 重新生成 Rust/Dart/C 绑定，再构建原生库和 Flutter 界面。
+默认特性为 `flutter,screencapturekit`，拒绝启用 `hwcodec`，不引入其 FFmpeg/libvmaf 依赖。
+上游软件编码仍需 libyuv、libvpx、aom、opus 和 libsodium；可通过上游支持的 Homebrew
+或 `VCPKG_ROOT` 依赖目录提供，它们不应取自鸿蒙仓库的源码或构建目录。
+Flutter 依赖遵循已核对的锁文件；缓存完整时可设 `NORMAN_PUB_OFFLINE=1`。
+目标默认是当前 Mac 架构；HAL 单独生成 arm64 与 x86_64 通用二进制。
 
-```text
-flutter/build/macos/Build/Products/Release/NormanRemoteDesktop.app
-```
-
-正式发布前要对整个应用及其嵌套 Framework/动态库完成 macOS Developer ID 签名和公证。没有签名和公证的包只适合开发机验证。
-
-### macOS 配套组件
-
-CM Helper 和虚拟声卡位于 Norman Remote Desktop 配套工程中，在已经安装目标 RustDesk fork 的 Mac 上构建：
+可覆盖输出位置：
 
 ```sh
-./tools/build-rustdesk-cm-helper-pkg.sh
+export NORMAN_MACOS_OUTPUT_DIR=/path/to/output
+./tools/build-macos-app.sh
+NORMAN_RUSTDESK_APP_PATH="$NORMAN_MACOS_OUTPUT_DIR/NormanRemoteDesktop.app" \
+NORMAN_CM_HELPER_OUTPUT_DIR="$NORMAN_MACOS_OUTPUT_DIR" \
+  ./tools/build-rustdesk-cm-helper-pkg.sh
+./tools/package-macos-distribution.sh
 ```
 
-构建脚本会检查目标应用为 RustDesk 1.4.9 兼容构建，并生成包含以下内容的安装包：
+## 签名与验收边界
 
-- `--cm-no-ui` 连接管理 LaunchAgent；
-- `NormanRemoteMic.driver` CoreAudio HAL 插件；
-- 音频设备探测和显式路由配置脚本；
-- TCC 状态检查和修复脚本 `repair-tcc.sh`；
-- 可审计的虚拟声卡源代码、许可证和 RustDesk 路由补丁。
+未提供 `NORMAN_APP_SIGNING_IDENTITY` 时，应用构建采用开发用 ad-hoc 签名。
+这不代表另一台 Mac 可正常双击安装，分发校验也会拒绝把 ad-hoc App 当作稳定签名版本。
+正式分发需 Developer ID Application、Developer ID Installer 及公证：
 
-## 受控 Mac 安装和配置
+```sh
+# 使用已配置的 Keychain profile，不把凭证存进仓库。
+NORMAN_NOTARY_PROFILE=your-profile ./tools/sign-notarize-macos-distribution.sh
+NORMAN_STRICT_DISTRIBUTION=1 ./tools/verify-macos-distribution.sh
+```
 
-1. 退出旧版 RustDesk，再将 fork 应用安装到 `/Applications/NormanRemoteDesktop.app`。
-2. 首次运行时，按照 macOS 实际提示授予屏幕录制、辅助功能/输入监控等远程控制所需权限。macOS 不允许应用静默授予 TCC；本功能的默认输入切换不绕过 TCC。受控 RustDesk 不采集物理麦克风，因此不需要用 RustDesk 的麦克风权限替代 Codex 等目标应用自己的麦克风权限。
-3. 安装 CM Helper 包，并等待 CoreAudio 重新加载；必要时重新登录或重启 CoreAudio。
-4. 如果手机提示受控端权限未就绪，先在受控 Mac 主程序中点击“检查并修复”，或运行：
+编译通过、签名通过、系统授权和真实远程功能是不同验收层。
+发布前应在目标 Mac 验证画面/输入、全屏连接、重复按住说话、锁屏重连、两种回传模式与设备恢复。
 
-   ```sh
-   HELPER="$HOME/Library/Application Support/NormanRemoteDesktop/cm-helper"
-   "$HELPER/repair-tcc.sh" repair
-   ```
+## 防止再次散落
 
-   按 macOS 系统设置逐项开启三项权限后，再回到手机重新检查。
-5. 检查并选择 Norman 虚拟设备：
+```sh
+node --test tools/macos-source-tests.cjs
+```
 
-   ```sh
-   HELPER="$HOME/Library/Application Support/NormanRemoteDesktop/cm-helper"
-   "$HELPER/remote-mic-config.sh" list
-   "$HELPER/remote-mic-config.sh" select-norman-output
-   "$HELPER/remote-mic-config.sh" restart
-   "$HELPER/remote-mic-config.sh" status
-   ```
+该检查覆盖功能源码、Guide 与 FFI 配套、无构建补丁/鸿蒙路径依赖、安装器权限边界和版本一致性。
+迁移清单见 [MACOS_SOURCE_OWNERSHIP.md](MACOS_SOURCE_OWNERSHIP.md)。
 
-6. 语音会话接通后，RustDesk 会把系统默认输入临时切到 Norman 手机麦克风，并在会话结束时恢复。若 Codex 或其他目标应用固定绑定了某个具体输入设备而不是跟随系统默认输入，仍需在该应用内手动选择 Norman 手机麦克风；这不属于 RustDesk 可以替换的 TCC 授权。
-7. 在手机 HAP 中连接到该 Mac；连接后显示麦克风对讲按钮，按住按钮开始说话。
-
-普通远程桌面音频和手机麦克风输入是两条不同用途的路径。CM 可以处于 ready，而音频仍保持 disabled；只有明确选择 Norman 输出并启用手机端对讲时，手机音频才会进入虚拟设备。
-
-## 配置状态
-
-受控端 Helper 状态的含义如下：
-
-- `disabled`：音频路由关闭，默认状态；
-- `requires-patched-rustdesk`：检测到设备配置，但 RustDesk 主程序不含 Norman 音频路由补丁；
-- `not-configured`：主程序含补丁，但尚未选择输出设备；
-- `candidate`：设备同时有输入/输出通道，但尚未完成用户确认；
-- `ready`：已确认回环和路由，可供目标应用选择；
-- `unavailable`：之前选择的设备当前不存在或不可用。
-
-如果 Helper 已安装但手机仍提示“受控端虚拟麦克风未加载”，先运行 `status`，确认 CoreAudio 能看到 `Norman 手机麦克风`，再重启 Helper；不能仅凭目录存在就判断组件 ready。
-
-TCC 状态另行写入 `tcc-status.json`，并以 `tcc-state-ready`、
-`tcc-state-needs-attention` 或 `tcc-state-unknown` 标记。Helper ready 不代表
-TCC ready；两者都会在手机端分别显示。
-
-## 升级和身份兼容
-
-Mac 应用的用户可见名称是 `Norman Remote Desktop`，应用包目录名是 `NormanRemoteDesktop.app`。为兼容已有受控端安装和 CM 管理，本 fork 暂时保留 RustDesk 的内部 Bundle ID `com.carriez.rustdesk`；不要在普通升级中随意改成新的 Bundle ID，否则系统会把它当作新应用并要求重新授权。
-
-HarmonyOS HAP 使用独立的包名 `com.norman.remotedesktop`。手机端 HAP 的签名必须与目标安装/升级策略一致；未签名 HAP 只能作为构建产物，不能直接安装到真机。
-
-## 安全边界
-
-- 远程麦克风功能只处理手机端明确发起的语音通话流。
-- macOS 受控端默认不采集物理麦克风、不录音；只有在用户启用 Norman 虚拟输入并接通手机语音会话时，才会临时修改系统默认输入，并在结束/断线时恢复。
-- CM Helper 负责后台连接管理和音频桥接，不执行手机端下发的任意 Shell 命令。
-- 使用剪切板同步、麦克风输入和第三方虚拟音频设备前，应确认目标设备和网络属于自己或已获授权的范围。
+本 fork 保留 RustDesk 版权、许可证和上游归属；HAL 的 Apple 示例许可证随源码保留。

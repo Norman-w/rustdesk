@@ -10,6 +10,7 @@ import 'package:flutter_hbb/common/widgets/audio_input.dart';
 import 'package:flutter_hbb/common/widgets/setting_widgets.dart';
 import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/desktop/pages/desktop_home_page.dart';
+import 'package:flutter_hbb/desktop/pages/macos_setup_guide_page.dart';
 import 'package:flutter_hbb/desktop/pages/desktop_tab_page.dart';
 import 'package:flutter_hbb/desktop/widgets/remote_toolbar.dart';
 import 'package:flutter_hbb/mobile/widgets/dialog.dart';
@@ -52,6 +53,7 @@ class _TabInfo {
 
 enum SettingsTabKey {
   general,
+  normanGuide,
   safety,
   network,
   display,
@@ -65,6 +67,8 @@ class DesktopSettingPage extends StatefulWidget {
   final SettingsTabKey initialTabkey;
   static final List<SettingsTabKey> tabKeys = [
     SettingsTabKey.general,
+    if (isMacOS && !bind.isOutgoingOnly())
+      SettingsTabKey.normanGuide,
     if (!isWeb &&
         !bind.isOutgoingOnly() &&
         !bind.isDisableSettings() &&
@@ -184,6 +188,10 @@ class _DesktopSettingPageState extends State<DesktopSettingPage>
           settingTabs.add(_TabInfo(
               tab, 'General', Icons.settings_outlined, Icons.settings));
           break;
+        case SettingsTabKey.normanGuide:
+          settingTabs.add(_TabInfo(tab, 'macos_setup_guide_nav',
+              Icons.fact_check_outlined, Icons.fact_check));
+          break;
         case SettingsTabKey.safety:
           settingTabs.add(_TabInfo(tab, 'Security',
               Icons.enhanced_encryption_outlined, Icons.enhanced_encryption));
@@ -223,6 +231,9 @@ class _DesktopSettingPageState extends State<DesktopSettingPage>
       switch (tab) {
         case SettingsTabKey.general:
           children.add(const _General());
+          break;
+        case SettingsTabKey.normanGuide:
+          children.add(const MacosSetupGuidePage());
           break;
         case SettingsTabKey.safety:
           children.add(const _Safety());
@@ -420,6 +431,7 @@ class _GeneralState extends State<_General> {
         _Card(title: 'Language', children: [language()]),
         if (!isWeb) hwcodec(),
         if (!isWeb) audio(context),
+        if (!isWeb) macAudioRoute(context),
         if (!isWeb) record(context),
         if (!isWeb) WaylandCard(),
         other()
@@ -731,6 +743,45 @@ class _GeneralState extends State<_General> {
     }
 
     return AudioInput(builder: builder, isCm: false, isVoiceCall: false);
+  }
+
+  Widget macAudioRoute(BuildContext context) {
+    if (!Platform.isMacOS || bind.isOutgoingOnly()) {
+      return const Offstage();
+    }
+
+    return futureBuilder(
+      future: bind.mainGetOption(key: kOptionMacAudioRoute),
+      hasData: (data) {
+        final savedRoute = data is String ? data : '';
+        final currentRoute = savedRoute == kMacAudioRouteVirtualOutput
+            ? kMacAudioRouteVirtualOutput
+            : kMacAudioRouteSystem;
+        return _Card(
+          title: 'Remote audio output',
+          children: [
+            ComboBox(
+              keys: const [
+                kMacAudioRouteSystem,
+                kMacAudioRouteVirtualOutput,
+              ],
+              values: [
+                translate('Computer speakers and phone'),
+                translate('Norman Remote Audio virtual output'),
+              ],
+              initialKey: currentRoute,
+              onChanged: (route) async {
+                await bind.mainSetOption(
+                    key: kOptionMacAudioRoute, value: route);
+                if (mounted) {
+                  setState(() {});
+                }
+              },
+            ).marginOnly(left: _kContentHMargin),
+          ],
+        );
+      },
+    );
   }
 
   Widget record(BuildContext context) {
@@ -1282,11 +1333,57 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
             if (usePassword && !isChangePermanentPasswordDisabled())
               _SubButton('Set permanent password', setPasswordDialog,
                   permEnabled && !locked),
-            // if (usePassword)
-            //   hide_cm(!locked).marginOnly(left: _kContentHSubMargin - 6),
+            if (isMacOS && usePassword)
+              fullScreenSpaceInterruption(!locked)
+                  .marginOnly(left: _kContentHSubMargin - 5),
             if (usePassword) radios[2],
           ]);
         })));
+  }
+
+  Widget fullScreenSpaceInterruption(bool enabled) {
+    return ChangeNotifierProvider.value(
+        value: gFFI.serverModel,
+        child: Consumer<ServerModel>(builder: (context, model, child) {
+          final canHideConnectionManager =
+              model.approveMode == 'password' &&
+                  model.verificationMethod == kUsePermanentPassword;
+          final canChange = enabled && canHideConnectionManager &&
+              !isOptionFixed(kOptionAllowHideCm);
+          final allowInterruption = !model.hideCm;
+
+          void onChanged(bool? value) {
+            if (value == null) return;
+            bind.mainSetOption(
+                key: kOptionAllowHideCm,
+                value: bool2option(kOptionAllowHideCm, !value));
+          }
+
+          return Tooltip(
+              message: canHideConnectionManager
+                  ? translate('macos_space_session_interrupt_tip')
+                  : translate('hide_cm_tip'),
+              child: GestureDetector(
+                onTap: canChange
+                    ? () => onChanged(!allowInterruption)
+                    : null,
+                child: Row(
+                  children: [
+                    Checkbox(
+                            value: allowInterruption,
+                            onChanged: canChange ? onChanged : null)
+                        .marginOnly(right: 5),
+                    Expanded(
+                      child: Text(
+                        translate('macos_space_session_interrupt'),
+                        style: TextStyle(
+                            color: disabledTextColor(context, canChange)),
+                      ),
+                    ),
+                  ],
+                ),
+              ));
+        }));
   }
 
   Widget more(BuildContext context) {

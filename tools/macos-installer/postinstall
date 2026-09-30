@@ -1,0 +1,40 @@
+#!/bin/bash
+set -eu
+
+app_path="/Applications/NormanRemoteDesktop.app"
+service_label="system/com.carriez.NormanRemoteDesktop_service"
+service_plist="/Library/LaunchDaemons/com.carriez.NormanRemoteDesktop_service.plist"
+state_file="/var/tmp/com.carriez.NormanRemoteDesktop.pkg-install-state"
+
+/usr/bin/xattr -dr com.apple.quarantine "$app_path" >/dev/null 2>&1 || true
+
+installed_bundle_id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \
+  "$app_path/Contents/Info.plist" 2>/dev/null || true)
+if [ "$installed_bundle_id" != "com.carriez.NormanRemoteDesktop" ]; then
+  printf 'The installed app has an unexpected bundle identifier: %s\n' "$installed_bundle_id" >&2
+  exit 1
+fi
+
+service_was_loaded=0
+if [ -f "$state_file" ]; then
+  service_was_loaded=$(/bin/cat "$state_file" 2>/dev/null || printf '0')
+fi
+
+if [ "$service_was_loaded" = "1" ] && [ -f "$service_plist" ]; then
+  printf 'Restoring the Norman Remote Desktop service...\n'
+  /bin/launchctl bootstrap system "$service_plist" >/dev/null 2>&1 || true
+  /bin/launchctl kickstart -k "$service_label" >/dev/null 2>&1 || true
+fi
+
+/bin/rm -f "$state_file"
+
+console_user=$(/usr/bin/stat -f '%Su' /dev/console 2>/dev/null || printf 'root')
+if [ "$console_user" != "root" ] && [ "$console_user" != "loginwindow" ]; then
+  console_uid=$(/usr/bin/id -u "$console_user" 2>/dev/null || true)
+  if [ -n "$console_uid" ]; then
+    printf 'Opening Norman Remote Desktop for %s...\n' "$console_user"
+    /bin/launchctl asuser "$console_uid" /usr/bin/open "$app_path" >/dev/null 2>&1 || true
+  fi
+fi
+
+printf 'Norman Remote Desktop PKG installation complete.\n'

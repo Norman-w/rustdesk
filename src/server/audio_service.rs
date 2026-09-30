@@ -17,6 +17,8 @@ use super::*;
 use hbb_common::anyhow::anyhow;
 use magnum_opus::{Application::*, Channels::*, Encoder};
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_os = "macos")]
+use std::sync::atomic::AtomicUsize;
 
 pub const NAME: &'static str = "audio";
 pub const AUDIO_DATA_SIZE_U8: usize = 960 * 4; // 10ms in 48000 stereo
@@ -24,6 +26,61 @@ static RESTARTING: AtomicBool = AtomicBool::new(false);
 
 lazy_static::lazy_static! {
     static ref VOICE_CALL_INPUT_DEVICE: Arc::<Mutex::<Option<String>>> = Default::default();
+}
+
+#[cfg(target_os = "macos")]
+pub const NORMAN_REMOTE_AUDIO_OUTPUT_DEVICE: &str = "Norman Remote Audio";
+
+#[cfg(target_os = "macos")]
+static REMOTE_AUDIO_SUBSCRIBERS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(target_os = "macos")]
+static REMOTE_AUDIO_ROUTE_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+#[cfg(target_os = "macos")]
+pub fn remote_audio_route_is_virtual() -> bool {
+    Config::get_option("mac-audio-route") == "virtual-output"
+}
+
+#[cfg(target_os = "macos")]
+pub fn refresh_remote_audio_route() {
+    let should_route = REMOTE_AUDIO_SUBSCRIBERS.load(Ordering::SeqCst) > 0
+        && remote_audio_route_is_virtual();
+    let route_active = REMOTE_AUDIO_ROUTE_ACTIVE.load(Ordering::SeqCst);
+    if should_route && !route_active {
+        if crate::platform::begin_remote_audio_route(NORMAN_REMOTE_AUDIO_OUTPUT_DEVICE) {
+            REMOTE_AUDIO_ROUTE_ACTIVE.store(true, Ordering::SeqCst);
+            log::info!(
+                "Norman system audio route enabled through '{}'",
+                NORMAN_REMOTE_AUDIO_OUTPUT_DEVICE
+            );
+        } else {
+            log::warn!(
+                "Norman system audio route could not select '{}'",
+                NORMAN_REMOTE_AUDIO_OUTPUT_DEVICE
+            );
+        }
+    } else if !should_route && route_active {
+        crate::platform::end_remote_audio_route();
+        REMOTE_AUDIO_ROUTE_ACTIVE.store(false, Ordering::SeqCst);
+        log::info!("Norman system audio route restored");
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn set_remote_audio_subscription(enabled: bool) {
+    if enabled {
+        REMOTE_AUDIO_SUBSCRIBERS.fetch_add(1, Ordering::SeqCst);
+    } else {
+        let previous = REMOTE_AUDIO_SUBSCRIBERS
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                count.checked_sub(1)
+            })
+            .unwrap_or(0);
+        if previous == 0 {
+            return;
+        }
+    }
+    refresh_remote_audio_route();
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
@@ -196,6 +253,8 @@ mod cpal_impl {
 
     fn run_restart(sp: EmptyExtraFieldService, state: &mut State) -> ResultType<()> {
         state.reset();
+        #[cfg(target_os = "macos")]
+        super::refresh_remote_audio_route();
         sp.snapshot(|_sps: ServiceSwap<_>| Ok(()))?;
         match &state.stream {
             None => {
@@ -211,6 +270,8 @@ mod cpal_impl {
     }
 
     fn run_serv_snapshot(sp: EmptyExtraFieldService, state: &mut State) -> ResultType<()> {
+        #[cfg(target_os = "macos")]
+        super::refresh_remote_audio_route();
         sp.snapshot(|sps| {
             match &state.stream {
                 None => {
@@ -263,9 +324,24 @@ mod cpal_impl {
     fn get_device() -> ResultType<(Device, SupportedStreamConfig)> {
         #[cfg(target_os = "macos")]
         {
-            return Err(anyhow!(
-                "controlled-device microphone capture is disabled in the Norman macOS receiver"
-            ));
+            if super::remote_audio_route_is_virtual() {
+                return get_audio_input(super::NORMAN_REMOTE_AUDIO_OUTPUT_DEVICE);
+            }
+            if !is_screen_capture_kit_available() {
+                return Err(anyhow!(
+                    "ScreenCaptureKit system-audio loopback is unavailable"
+                ));
+            }
+            let device = HOST_SCREEN_CAPTURE_KIT
+                .as_ref()?
+                .default_input_device()
+                .with_context(|| "Failed to get default ScreenCaptureKit loopback device")?;
+            let format = device
+                .default_input_config()
+                .map_err(|e| anyhow!(e))
+                .with_context(|| "Failed to get ScreenCaptureKit loopback format")?;
+            log::info!("Default ScreenCaptureKit loopback format: {:?}", format);
+            return Ok((device, format));
         }
         let audio_input = super::get_audio_input();
         if !audio_input.is_empty() {
@@ -312,7 +388,7 @@ mod cpal_impl {
         #[cfg(target_os = "macos")]
         {
             return Err(anyhow!(
-                "controlled-device microphone capture is disabled in the Norman macOS receiver"
+                "ScreenCaptureKit feature is required for Norman macOS system audio"
             ));
         }
         let audio_input = super::get_audio_input();

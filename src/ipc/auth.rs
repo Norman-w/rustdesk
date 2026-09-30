@@ -92,11 +92,14 @@ fn macos_service_ipc_allows_gui_and_service_binaries(
     }
 
     // On installed macOS builds, `_service` is listened by the `service` binary while the GUI
-    // process connects from the app executable within the same app bundle.
+    // process connects from the app executable within the same app bundle. Custom macOS builds
+    // may keep RustDesk's core runtime name while changing CFBundleExecutable, so also read the
+    // bundle's executable name instead of relying only on the runtime custom-client name.
     let gui_exe_name = std::ffi::OsString::from(crate::get_app_name());
     let gui_exe = gui_exe_name.as_os_str();
     let service_exe = std::ffi::OsStr::new("service");
-    let allowed_exe = [Some(gui_exe), Some(service_exe)];
+    let bundle_exe = macos_bundle_executable_name(current_exe);
+    let allowed_exe = [Some(gui_exe), bundle_exe.as_deref(), Some(service_exe)];
     let peer_name = peer_exe.file_name();
     let current_name = current_exe.file_name();
     allowed_exe
@@ -105,6 +108,24 @@ fn macos_service_ipc_allows_gui_and_service_binaries(
         && allowed_exe
             .iter()
             .any(|name| os_str_eq_ignore_ascii_case(current_name, *name))
+}
+
+#[cfg(target_os = "macos")]
+#[inline]
+fn macos_bundle_executable_name(current_exe: &Path) -> Option<std::ffi::OsString> {
+    let bundle_root = current_exe.parent()?.parent()?.parent()?;
+    let info_plist = bundle_root.join("Contents/Info.plist");
+    let output = std::process::Command::new("/usr/bin/plutil")
+        .args(["-extract", "CFBundleExecutable", "raw", "-o", "-"])
+        .arg(info_plist)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let contents = String::from_utf8(output.stdout).ok()?;
+    let value = contents.trim();
+    (!value.is_empty()).then(|| std::ffi::OsString::from(value))
 }
 
 #[cfg(target_os = "windows")]

@@ -2084,15 +2084,20 @@ impl Connection {
         self.audio && !self.disable_audio
     }
 
-    /// The custom macOS voice-input path is receive-only. During a voice call,
-    /// never subscribe this connection to the controlled device's audio input.
+    /// On macOS, ordinary audio subscription uses ScreenCaptureKit's system
+    /// audio loopback. The phone microphone remains a separate voice-call
+    /// stream routed to the Norman virtual microphone output device.
     fn audio_subscription_enabled(&self) -> bool {
-        // The Norman macOS receiver is intentionally microphone-free.  Keep
-        // this guard independent of the controller's legacy `disable_audio`
-        // preference so an older phone build cannot re-enable Mac mic capture.
         #[cfg(target_os = "macos")]
         {
-            false
+            #[cfg(feature = "screencapturekit")]
+            {
+                self.audio_enabled()
+            }
+            #[cfg(not(feature = "screencapturekit"))]
+            {
+                false
+            }
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -3682,13 +3687,14 @@ impl Connection {
                         // answer the incoming voice-call event. When the Norman
                         // virtual-input route is explicitly configured, accept
                         // it here so the phone does not wait for the 15s request
-                        // timeout. This is deliberately limited to the macOS
-                        // `--server` process and does not open the controlled
-                        // Mac's built-in microphone.
+                        // timeout. The configured Norman route is explicit opt-in
+                        // and does not open the controlled Mac's built-in microphone.
                         #[cfg(target_os = "macos")]
                         {
-                            let headless_server = std::env::args().any(|arg| arg == "--server");
-                            if headless_server && configured_remote_mic_output_device().is_some() {
+                            // The normal App starts an internal --cm process rather
+                            // than exposing the legacy --server argument, so do not
+                            // gate this path on the process name.
+                            if configured_remote_mic_output_device().is_some() {
                                 log::info!(
                                     "Auto-accepting incoming voice call for the configured Norman virtual input"
                                 );
@@ -4488,6 +4494,9 @@ impl Connection {
     }
 
     pub async fn close_voice_call(&mut self) {
+        // Stop the CPAL output before restoring the user's normal input. Keeping
+        // the old stream alive made the next virtual-input call intermittent.
+        drop(std::mem::replace(&mut self.audio_sender, None));
         #[cfg(target_os = "macos")]
         self.end_remote_mic_route();
         crate::audio_service::set_voice_call_input_device(None, true);
@@ -4899,6 +4908,7 @@ impl Connection {
         // But it's not necessary now and we have to consider two audio services(client, server).
         // Restore the system input if the peer disappears without sending an
         // explicit voice-call close message.
+        drop(std::mem::replace(&mut self.audio_sender, None));
         #[cfg(target_os = "macos")]
         self.end_remote_mic_route();
         crate::audio_service::set_voice_call_input_device(None, true);
@@ -5954,7 +5964,20 @@ async fn start_ipc(
     if stream.is_none() {
         #[allow(unused_mut)]
         #[allow(unused_assignments)]
-        let mut args = vec!["--cm"];
+        // A password-authenticated macOS session does not need an approval
+        // window.  Starting the Flutter CM window as a second NSApplication
+        // can tear down inside CVDisplayLink before the video session is
+        // authorized, leaving the peer connected but waiting for video.
+        // Keep the normal window for click/both approval modes, where a user
+        // decision is still required.
+        let mut args = if cfg!(target_os = "macos")
+            && hbb_common::password_security::approve_mode()
+                == hbb_common::password_security::ApproveMode::Password
+        {
+            vec!["--cm-no-ui"]
+        } else {
+            vec!["--cm"]
+        };
         #[allow(unused_mut)]
         #[cfg(target_os = "linux")]
         let mut user = None;

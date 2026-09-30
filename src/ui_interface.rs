@@ -443,7 +443,7 @@ pub fn set_option(key: String, value: String) {
                 return;
             }
         }
-    } else if &key == "audio-input" {
+    } else if &key == "audio-input" || &key == "mac-audio-route" {
         #[cfg(not(target_os = "ios"))]
         crate::audio_service::restart();
     }

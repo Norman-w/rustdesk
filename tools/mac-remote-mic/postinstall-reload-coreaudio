@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+
+# The HAL plug-in is loaded into coreaudiod and replacing the bundle does not
+# unload the old code. PackageKit runs postinstall as root, so reload the
+# audio daemon here; launchd will start it again immediately.
+/usr/bin/killall coreaudiod 2>/dev/null || /bin/launchctl kickstart -k system/com.apple.audio.coreaudiod
+exit 0

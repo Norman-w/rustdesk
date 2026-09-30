@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<installer-gui-script minSpecVersion="1">
+    <title>Norman 远程桌面受控端组件</title>
+    <welcome file="welcome.html" mime-type="text/html"/>
+    <options customize="never" require-scripts="false" hostArchitectures="x86_64,arm64"/>
+    <domains enable_anywhere="false" enable_currentUserHome="false" enable_localSystem="true"/>
+    <choices-outline>
+        <line choice="default">
+            <line choice="com.norman.remotedesktop.cm-helper"/>
+        </line>
+    </choices-outline>
+    <choice id="default"/>
+    <choice id="com.norman.remotedesktop.cm-helper" visible="false"
+            title="Norman 远程桌面后台组件"
+            description="保持 RustDesk 连接管理在后台运行，保护全屏应用和 Spaces 的焦点；同时提供可选的 Norman 手机麦克风音频桥接。默认不会录音、不会修改系统默认输入设备。">
+        <pkg-ref id="com.norman.remotedesktop.cm-helper"/>
+    </choice>
+    <pkg-ref id="com.norman.remotedesktop.cm-helper" version="__VERSION__" onConclusion="none">__COMPONENT_PACKAGE__</pkg-ref>
+</installer-gui-script>

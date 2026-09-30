@@ -21,7 +21,7 @@ Yet another remote desktop solution, written in Rust. Works out of the box with 
 
 ## Norman Remote Desktop fork
 
-This branch contains the Norman Remote Desktop macOS fork based on RustDesk 1.4.9. In addition to the upstream remote desktop features, it provides a headless `--cm-no-ui` connection manager for keeping full-screen apps and Spaces focused, plus an opt-in route for receiving the phone microphone through a Norman CoreAudio virtual input. The user-facing macOS app is `Norman Remote Desktop` (`NormanRemoteDesktop.app`); the internal Bundle ID remains `com.carriez.rustdesk` for upgrade compatibility.
+This branch contains the Norman Remote Desktop macOS fork based on RustDesk 1.4.9. In addition to the upstream remote desktop features, it provides a headless `--cm-no-ui` connection manager for keeping full-screen apps and Spaces focused, plus an opt-in route for receiving the phone microphone through a Norman CoreAudio virtual input. The user-facing macOS app is `Norman Remote Desktop` (`NormanRemoteDesktop.app`), with Bundle ID `com.carriez.NormanRemoteDesktop`.
 
 中文的 fork 特性、Mac mini 构建、受控端安装、虚拟声卡配置和安全边界说明见：[Norman fork 中文使用说明](docs/NORMAN_FORK_ZH-CN.md)。
 

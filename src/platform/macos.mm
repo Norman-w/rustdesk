@@ -145,6 +145,153 @@ bool set_default_remote_mic_input(AudioDeviceID device) {
     return AudioObjectSetPropertyData(
                kAudioObjectSystemObject, &address, 0, nullptr, data_size, &device) == noErr;
 }
+
+AudioDeviceID find_remote_audio_output(const char *requested_name) {
+    if (requested_name == nullptr || requested_name[0] == '\0') {
+        return kAudioObjectUnknown;
+    }
+
+    CFStringRef requested = CFStringCreateWithCString(
+        kCFAllocatorDefault, requested_name, kCFStringEncodingUTF8);
+    if (requested == nullptr) {
+        return kAudioObjectUnknown;
+    }
+
+    const auto devices_address = remote_mic_property_address(
+        kAudioHardwarePropertyDevices,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain);
+    UInt32 data_size = 0;
+    OSStatus status = AudioObjectGetPropertyDataSize(
+        kAudioObjectSystemObject, &devices_address, 0, nullptr, &data_size);
+    if (status != noErr || data_size < sizeof(AudioDeviceID)) {
+        CFRelease(requested);
+        return kAudioObjectUnknown;
+    }
+
+    std::vector<AudioDeviceID> devices(data_size / sizeof(AudioDeviceID));
+    status = AudioObjectGetPropertyData(
+        kAudioObjectSystemObject,
+        &devices_address,
+        0,
+        nullptr,
+        &data_size,
+        devices.data());
+    if (status != noErr) {
+        CFRelease(requested);
+        return kAudioObjectUnknown;
+    }
+
+    const auto name_address = remote_mic_property_address(
+        kAudioObjectPropertyName,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain);
+    const auto output_stream_address = remote_mic_property_address(
+        kAudioDevicePropertyStreamConfiguration,
+        kAudioObjectPropertyScopeOutput,
+        kAudioObjectPropertyElementMain);
+
+    AudioDeviceID result = kAudioObjectUnknown;
+    for (AudioDeviceID device : devices) {
+        UInt32 name_size = sizeof(CFStringRef);
+        CFStringRef device_name = nullptr;
+        if (AudioObjectGetPropertyData(
+                device, &name_address, 0, nullptr, &name_size, &device_name) != noErr ||
+            device_name == nullptr ||
+            CFStringCompare(device_name, requested, 0) != kCFCompareEqualTo) {
+            continue;
+        }
+
+        UInt32 stream_size = 0;
+        if (AudioObjectGetPropertyDataSize(
+                device, &output_stream_address, 0, nullptr, &stream_size) != noErr ||
+            stream_size < sizeof(AudioBufferList)) {
+            continue;
+        }
+
+        std::vector<UInt32> storage(
+            (stream_size + sizeof(UInt32) - 1) / sizeof(UInt32));
+        auto *buffers = reinterpret_cast<AudioBufferList *>(storage.data());
+        if (AudioObjectGetPropertyData(
+                device,
+                &output_stream_address,
+                0,
+                nullptr,
+                &stream_size,
+                buffers) != noErr) {
+            continue;
+        }
+
+        bool has_output = false;
+        for (UInt32 i = 0; i < buffers->mNumberBuffers; ++i) {
+            if (buffers->mBuffers[i].mNumberChannels > 0) {
+                has_output = true;
+                break;
+            }
+        }
+        if (has_output) {
+            result = device;
+            break;
+        }
+    }
+
+    CFRelease(requested);
+    return result;
+}
+
+bool get_default_remote_audio_output(AudioDeviceID *device) {
+    if (device == nullptr) {
+        return false;
+    }
+    const auto address = remote_mic_property_address(
+        kAudioHardwarePropertyDefaultOutputDevice,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain);
+    UInt32 data_size = sizeof(*device);
+    return AudioObjectGetPropertyData(
+               kAudioObjectSystemObject, &address, 0, nullptr, &data_size, device) == noErr &&
+        *device != kAudioObjectUnknown;
+}
+
+bool set_default_remote_audio_output(AudioDeviceID device) {
+    if (device == kAudioObjectUnknown) {
+        return false;
+    }
+    const auto address = remote_mic_property_address(
+        kAudioHardwarePropertyDefaultOutputDevice,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain);
+    UInt32 data_size = sizeof(device);
+    return AudioObjectSetPropertyData(
+               kAudioObjectSystemObject, &address, 0, nullptr, data_size, &device) == noErr;
+}
+
+bool get_default_remote_system_output(AudioDeviceID *device) {
+    if (device == nullptr) {
+        return false;
+    }
+    const auto address = remote_mic_property_address(
+        kAudioHardwarePropertyDefaultSystemOutputDevice,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain);
+    UInt32 data_size = sizeof(*device);
+    return AudioObjectGetPropertyData(
+               kAudioObjectSystemObject, &address, 0, nullptr, &data_size, device) == noErr &&
+        *device != kAudioObjectUnknown;
+}
+
+bool set_default_remote_system_output(AudioDeviceID device) {
+    if (device == kAudioObjectUnknown) {
+        return false;
+    }
+    const auto address = remote_mic_property_address(
+        kAudioHardwarePropertyDefaultSystemOutputDevice,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain);
+    UInt32 data_size = sizeof(device);
+    return AudioObjectSetPropertyData(
+               kAudioObjectSystemObject, &address, 0, nullptr, data_size, &device) == noErr;
+}
 }  // namespace
 
 extern "C" bool MacBeginRemoteMicRoute(const char *requested_name) {
@@ -195,6 +342,75 @@ extern "C" void MacEndRemoteMicRoute() {
         NSLog(@"Norman remote microphone input route restored");
     }
     g_saved_remote_mic_input = kAudioObjectUnknown;
+}
+
+namespace {
+std::mutex g_remote_audio_route_mutex;
+AudioDeviceID g_saved_remote_audio_output = kAudioObjectUnknown;
+AudioDeviceID g_saved_remote_system_output = kAudioObjectUnknown;
+unsigned int g_remote_audio_route_users = 0;
+}  // namespace
+
+extern "C" bool MacBeginRemoteAudioRoute(const char *requested_name) {
+    std::lock_guard<std::mutex> lock(g_remote_audio_route_mutex);
+    if (g_remote_audio_route_users > 0) {
+        ++g_remote_audio_route_users;
+        return true;
+    }
+
+    AudioDeviceID target = find_remote_audio_output(requested_name);
+    if (target == kAudioObjectUnknown) {
+        NSLog(@"Norman Remote Audio output device is unavailable");
+        return false;
+    }
+
+    AudioDeviceID current_output = kAudioObjectUnknown;
+    AudioDeviceID current_system_output = kAudioObjectUnknown;
+    if (!get_default_remote_audio_output(&current_output) ||
+        !get_default_remote_system_output(&current_system_output)) {
+        NSLog(@"Unable to read the current macOS default output devices");
+        return false;
+    }
+
+    if (target != current_output && !set_default_remote_audio_output(target)) {
+        NSLog(@"Unable to set the macOS default output to Norman Remote Audio");
+        return false;
+    }
+    if (target != current_system_output && !set_default_remote_system_output(target)) {
+        if (target != current_output) {
+            set_default_remote_audio_output(current_output);
+        }
+        NSLog(@"Unable to set the macOS system output to Norman Remote Audio");
+        return false;
+    }
+
+    g_saved_remote_audio_output = current_output;
+    g_saved_remote_system_output = current_system_output;
+    g_remote_audio_route_users = 1;
+    NSLog(@"Norman Remote Audio output route enabled");
+    return true;
+}
+
+extern "C" void MacEndRemoteAudioRoute() {
+    std::lock_guard<std::mutex> lock(g_remote_audio_route_mutex);
+    if (g_remote_audio_route_users == 0) {
+        return;
+    }
+
+    --g_remote_audio_route_users;
+    if (g_remote_audio_route_users > 0) {
+        return;
+    }
+
+    if (g_saved_remote_audio_output != kAudioObjectUnknown) {
+        set_default_remote_audio_output(g_saved_remote_audio_output);
+    }
+    if (g_saved_remote_system_output != kAudioObjectUnknown) {
+        set_default_remote_system_output(g_saved_remote_system_output);
+    }
+    NSLog(@"Norman Remote Audio output route restored");
+    g_saved_remote_audio_output = kAudioObjectUnknown;
+    g_saved_remote_system_output = kAudioObjectUnknown;
 }
 
 extern "C" bool CanUseNewApiForScreenCaptureCheck() {
