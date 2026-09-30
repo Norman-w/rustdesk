@@ -1,0 +1,128 @@
+name: Norman Windows x64 packages
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [codex/windows-x64-release]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: norman-windows-x64-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RUST_VERSION: '1.85.1'
+  FLUTTER_VERSION: '3.24.5'
+  VCPKG_COMMIT_ID: '120deac3062162151622ca4860575a33844ba10b'
+
+jobs:
+  bridge:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Install bridge prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake libclang-dev libgtk-3-dev nasm ninja-build pkg-config
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          prefix-key: norman-windows-bridge
+      - uses: subosito/flutter-action@2783a3f08e1baf891508463f8c6653c258246225
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+      - name: Generate bindings from this commit
+        run: |
+          cargo install cargo-expand --version 1.0.95 --locked
+          cargo install flutter_rust_bridge_codegen --version 1.80.1 --features uuid --locked
+          (cd flutter && flutter pub get --enforce-lockfile)
+          flutter_rust_bridge_codegen --rust-input src/flutter_ffi.rs --dart-output flutter/lib/generated_bridge.dart --c-output flutter/macos/Runner/bridge_generated.h --skip-add-mod-to-lib
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: norman-windows-bridge
+          if-no-files-found: error
+          path: |
+            src/bridge_generated.rs
+            src/bridge_generated.io.rs
+            flutter/lib/generated_bridge.dart
+            flutter/lib/generated_bridge.freezed.dart
+
+  windows:
+    runs-on: windows-2022
+    needs: bridge
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      VCPKG_ROOT: C:\norman-vcpkg
+      VCPKG_DEFAULT_TRIPLET: x64-windows-static
+      VCPKG_DEFAULT_HOST_TRIPLET: x64-windows-static
+      VCPKG_BINARY_SOURCES: clear;files,C:\norman-vcpkg-cache,readwrite
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: norman-windows-bridge
+          path: .
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          prefix-key: norman-windows-x64-soft-codec
+      - uses: KyleMayes/install-llvm-action@ebc0426251bc40c7cd31162802432c68818ab8f0
+        with:
+          version: '15.0.6'
+      - uses: subosito/flutter-action@2783a3f08e1baf891508463f8c6653c258246225
+        id: flutter
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          architecture: x64
+      - uses: microsoft/setup-msbuild@6fb02220983dee41ce7ae257b6f4d8f9bf5ed4ce
+      - name: Prepare the upstream Windows Flutter engine
+        env:
+          FLUTTER_ROOT: ${{ steps.flutter.outputs['CACHE-PATH'] }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          flutter precache --windows
+          Invoke-WebRequest https://github.com/rustdesk/engine/releases/download/main/windows-x64-release.zip -OutFile "$env:RUNNER_TEMP/engine.zip"
+          Expand-Archive "$env:RUNNER_TEMP/engine.zip" "$env:RUNNER_TEMP/engine"
+          Copy-Item "$env:RUNNER_TEMP/engine/*" "$env:FLUTTER_ROOT/bin/cache/artifacts/engine/windows-x64-release/" -Recurse -Force
+          git -C $env:FLUTTER_ROOT apply "$env:GITHUB_WORKSPACE/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff"
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: C:\norman-vcpkg-cache
+          key: norman-windows-soft-vcpkg-${{ env.VCPKG_COMMIT_ID }}-${{ hashFiles('res/vcpkg/**') }}
+      - name: Install software codec dependencies only
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          git clone https://github.com/microsoft/vcpkg $env:VCPKG_ROOT
+          git -C $env:VCPKG_ROOT checkout $env:VCPKG_COMMIT_ID
+          & "$env:VCPKG_ROOT/bootstrap-vcpkg.bat" -disableMetrics
+          New-Item -ItemType Directory -Force C:\norman-vcpkg-cache | Out-Null
+          & "$env:VCPKG_ROOT/vcpkg.exe" install --classic --triplet x64-windows-static --overlay-ports="$env:GITHUB_WORKSPACE/res/vcpkg" aom libjpeg-turbo libvpx libyuv opus
+      - name: Build and verify EXE, ZIP and MSI
+        run: ./tools/build-windows-x64.ps1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: NormanRemoteDesktop-Windows-x64
+          if-no-files-found: error
+          retention-days: 30
+          path: output/windows-x64/*

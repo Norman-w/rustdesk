@@ -4,7 +4,7 @@ set -eu
 tool_root="$(cd -- "$(dirname -- "$0")" && pwd)"
 project_root="$(cd -- "$tool_root/.." && pwd)"
 output_directory="${NORMAN_CM_HELPER_OUTPUT_DIR:-$project_root/output}"
-macos_version="${NORMAN_MACOS_VERSION:-1.4.10}"
+macos_version="${NORMAN_MACOS_VERSION:-1.4.11}"
 package_version="${NORMAN_CM_HELPER_VERSION:-1.3.0}"
 package_path="$output_directory/NormanRemoteDesktop-CMHelper-$package_version.pkg"
 distribution_template="$tool_root/rustdesk-cm-helper/distribution.dist"
