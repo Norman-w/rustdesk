@@ -24,6 +24,7 @@ try { flutter pub get --enforce-lockfile } finally { Pop-Location }
 $metadata = cargo metadata --locked --format-version 1 --features flutter --filter-platform x86_64-pc-windows-msvc | ConvertFrom-Json
 $enabled = @($metadata.resolve.nodes | Where-Object { $_.id -eq $metadata.resolve.root })[0].features
 if ('hwcodec' -in $enabled -or 'vram' -in $enabled) { throw 'Hardware codec features are forbidden in this build.' }
+cargo build --locked --package dylib_virtual_display --release
 cargo build --locked --features flutter --lib --release
 Push-Location flutter
 try { flutter build windows --release --no-pub } finally { Pop-Location }

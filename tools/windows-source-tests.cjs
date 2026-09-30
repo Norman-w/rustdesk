@@ -30,6 +30,7 @@ test('package versions agree across Rust, Flutter and the portable wrapper', () 
 });
 
 test('packages include dependencies and preserve upstream license and identity', () => {
+  assert.match(build, /cargo build --locked --package dylib_virtual_display --release/);
   assert.match(build, /Copy-Item target\/release\/deps\/dylib_virtual_display\.dll \$bundle/);
   assert.match(build, /Copy-Item LICENSE "\$bundle\/LICENSE"/);
   assert.match(build, /Compress-Archive "\$bundle\/\*"/);

@@ -108,7 +108,8 @@ jobs:
           Expand-Archive "$env:RUNNER_TEMP/engine.zip" "$env:RUNNER_TEMP/engine"
           Copy-Item "$env:RUNNER_TEMP/engine/*" "$env:FLUTTER_ROOT/bin/cache/artifacts/engine/windows-x64-release/" -Recurse -Force
           git -C $env:FLUTTER_ROOT apply "$env:GITHUB_WORKSPACE/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff"
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        id: software-codecs
         with:
           path: C:\norman-vcpkg-cache
           key: norman-windows-soft-vcpkg-${{ env.VCPKG_COMMIT_ID }}-${{ hashFiles('res/vcpkg/**') }}
@@ -121,6 +122,12 @@ jobs:
           & "$env:VCPKG_ROOT/bootstrap-vcpkg.bat" -disableMetrics
           New-Item -ItemType Directory -Force C:\norman-vcpkg-cache | Out-Null
           & "$env:VCPKG_ROOT/vcpkg.exe" install --classic --triplet x64-windows-static --overlay-ports="$env:GITHUB_WORKSPACE/res/vcpkg" aom libjpeg-turbo libvpx libyuv opus
+      - name: Save software codec cache before application compilation
+        if: steps.software-codecs.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: C:\norman-vcpkg-cache
+          key: ${{ steps.software-codecs.outputs.cache-primary-key }}
       - name: Build and verify EXE, ZIP and MSI
         run: ./tools/build-windows-x64.ps1
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
