@@ -35,7 +35,7 @@ test('packages include dependencies and preserve upstream license and identity',
   assert.match(build, /Copy-Item LICENSE "\$bundle\/LICENSE"/);
   assert.match(build, /Compress-Archive "\$bundle\/\*"/);
   assert.match(build, /python generate\.py/);
-  assert.match(build, /python preprocess\.py/);
+  assert.match(build, /python preprocess\.py --arp/);
   assert.doesNotMatch(build, /--app-name|msiexec|\/Applications\//);
 });
 

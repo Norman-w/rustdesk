@@ -73,7 +73,7 @@ Assert-X64PE "$out/$prefix.exe"
 
 Push-Location res/msi
 try {
-    python preprocess.py -d $bundle --version $version --revision-version 1
+    python preprocess.py --arp -d $bundle --version $version --revision-version 1
     nuget restore msi.sln
     msbuild msi.sln -p:Configuration=Release -p:Platform=x64 /p:TargetVersion=Windows10
     $msi = @(Get-ChildItem Package/bin/x64/Release/en-us/Package.msi)
