@@ -813,6 +813,64 @@ struct OwnedVirtualDisplayState {
     bool reconfigurationCallbackRegistered = false;
 };
 
+// Creating/reconfiguring CGVirtualDisplay can make WindowServer activate a
+// different Space (often the RustDesk utility window) while it re-enumerates
+// the headless display. Keep the pre-change frontmost application so a
+// session-owned display operation can return to the user's existing full
+// screen Space without trying to infer a window or an app-specific layout.
+struct FrontmostApplicationSnapshot {
+    pid_t pid = 0;
+};
+
+FrontmostApplicationSnapshot CaptureFrontmostApplication() {
+    __block pid_t pid = 0;
+    void (^capture)(void) = ^{
+        @autoreleasepool {
+            NSRunningApplication *application =
+                [[NSWorkspace sharedWorkspace] frontmostApplication];
+            if (application != nil) {
+                pid = application.processIdentifier;
+            }
+        }
+    };
+    if ([NSThread isMainThread]) {
+        capture();
+    } else {
+        dispatch_sync(dispatch_get_main_queue(), capture);
+    }
+    return FrontmostApplicationSnapshot{pid};
+}
+
+void RestoreFrontmostApplication(const FrontmostApplicationSnapshot &snapshot,
+                                 const char *reason) {
+    if (snapshot.pid <= 0) return;
+    // Give WindowServer one turn to finish moving the display/Space before
+    // activating the saved application. Activation is deliberately delayed
+    // and performed on the AppKit main queue; doing it from the display worker
+    // can race AppKit's own Space transition.
+    dispatch_after(
+        dispatch_time(DISPATCH_TIME_NOW, 180 * NSEC_PER_MSEC),
+        dispatch_get_main_queue(),
+        ^{
+            @autoreleasepool {
+                NSRunningApplication *application =
+                    [NSRunningApplication runningApplicationWithProcessIdentifier:snapshot.pid];
+                if (application == nil || application.terminated) {
+                    NSLog(@"Owned virtual display: saved frontmost application pid=%d is unavailable (%s)",
+                          snapshot.pid, reason == nullptr ? "unknown" : reason);
+                    return;
+                }
+                if (@available(macOS 14.0, *)) {
+                    [application activateWithOptions:0];
+                } else {
+                    [application activateWithOptions:NSApplicationActivateIgnoringOtherApps];
+                }
+                NSLog(@"Owned virtual display: restored frontmost application pid=%d (%s)",
+                      snapshot.pid, reason == nullptr ? "unknown" : reason);
+            }
+        });
+}
+
 std::mutex g_ownedVirtualDisplayMutex;
 OwnedVirtualDisplayState g_ownedVirtualDisplay;
 std::atomic<uint64_t> g_ownedVirtualDisplayReconfigurationEvents{0};
@@ -1177,6 +1235,7 @@ extern "C" int32_t MacOwnedVirtualDisplayApply(uint64_t ownerToken,
         uint32_t oldWidth = hadOwnedDisplay ? g_ownedVirtualDisplay.width : 0;
         uint32_t oldHeight = hadOwnedDisplay ? g_ownedVirtualDisplay.height : 0;
         uint64_t eventSerialAtStart = g_ownedVirtualDisplayReconfigurationEvents.load(std::memory_order_relaxed);
+        FrontmostApplicationSnapshot frontmost = CaptureFrontmostApplication();
         if (!hadOwnedDisplay) {
             if (CGDisplayRegisterReconfigurationCallback(OwnedVirtualDisplayReconfigurationCallback,
                                                          nullptr) != kCGErrorSuccess) {
@@ -1190,6 +1249,7 @@ extern "C" int32_t MacOwnedVirtualDisplayApply(uint64_t ownerToken,
                 if (display != nil) [display release];
                 if (descriptor != nil) [descriptor release];
                 ClearOwnedVirtualDisplayState();
+                RestoreFrontmostApplication(frontmost, "create_failed");
                 return kOwnedVirtualDisplayCreateFailed;
             }
             g_ownedVirtualDisplay.display = display;
@@ -1221,8 +1281,9 @@ extern "C" int32_t MacOwnedVirtualDisplayApply(uint64_t ownerToken,
             if (!hadOwnedDisplay) {
                 uint32_t serial = g_ownedVirtualDisplay.serial;
                 ClearOwnedVirtualDisplayState();
-                return WaitForOwnedVirtualDisplayRemoval(serial)
-                    ? kOwnedVirtualDisplayApplyFailed : kOwnedVirtualDisplayRestoreFailed;
+                bool removed = WaitForOwnedVirtualDisplayRemoval(serial);
+                RestoreFrontmostApplication(frontmost, "apply_failed");
+                return removed ? kOwnedVirtualDisplayApplyFailed : kOwnedVirtualDisplayRestoreFailed;
             }
             bool restored = oldWidth != 0 && oldHeight != 0 &&
                 ReapplyOwnedVirtualDisplaySettings(g_ownedVirtualDisplay.settings);
@@ -1234,11 +1295,13 @@ extern "C" int32_t MacOwnedVirtualDisplayApply(uint64_t ownerToken,
                 &restoreID, &restoreWidth, &restoreHeight, &restoreFailure);
             if (restored) {
                 g_ownedVirtualDisplay.displayID = restoreID;
+                RestoreFrontmostApplication(frontmost, "apply_rolled_back");
                 return kOwnedVirtualDisplayApplyFailed;
             }
             uint32_t serial = g_ownedVirtualDisplay.serial;
             ClearOwnedVirtualDisplayState();
             WaitForOwnedVirtualDisplayRemoval(serial);
+            RestoreFrontmostApplication(frontmost, "apply_restore_failed");
             return kOwnedVirtualDisplayRestoreFailed;
         }
 
@@ -1261,6 +1324,7 @@ extern "C" int32_t MacOwnedVirtualDisplayApply(uint64_t ownerToken,
                 if (restored) {
                     if (newSettings != nil) [newSettings release];
                     g_ownedVirtualDisplay.displayID = restoreID;
+                    RestoreFrontmostApplication(frontmost, "raster_timeout_rolled_back");
                     return failureStatus;
                 }
             }
@@ -1268,6 +1332,7 @@ extern "C" int32_t MacOwnedVirtualDisplayApply(uint64_t ownerToken,
             uint32_t serial = g_ownedVirtualDisplay.serial;
             ClearOwnedVirtualDisplayState();
             bool removed = WaitForOwnedVirtualDisplayRemoval(serial);
+            RestoreFrontmostApplication(frontmost, removed ? "raster_timeout" : "raster_timeout_cleanup_failed");
             if (!removed) return kOwnedVirtualDisplayRestoreFailed;
             return failureStatus;
         }
@@ -1290,6 +1355,7 @@ extern "C" int32_t MacOwnedVirtualDisplayApply(uint64_t ownerToken,
               actualDisplayID, actualWidth, actualHeight,
               static_cast<unsigned long long>(generation),
               static_cast<unsigned long long>(eventsSeen));
+        RestoreFrontmostApplication(frontmost, hadOwnedDisplay ? "resize" : "create");
         return kOwnedVirtualDisplayOk;
     }
 }
@@ -1304,9 +1370,11 @@ extern "C" int32_t MacOwnedVirtualDisplayRelease(uint64_t ownerToken, uint64_t g
         if (generation != g_ownedVirtualDisplay.generation) return kOwnedVirtualDisplayStaleGeneration;
         uint32_t serial = g_ownedVirtualDisplay.serial;
         uint32_t displayID = g_ownedVirtualDisplay.displayID;
+        FrontmostApplicationSnapshot frontmost = CaptureFrontmostApplication();
         ClearOwnedVirtualDisplayState();
         bool removed = WaitForOwnedVirtualDisplayRemoval(serial);
         NSLog(@"Owned virtual display released: id=%u removed=%d", displayID, removed ? 1 : 0);
+        RestoreFrontmostApplication(frontmost, removed ? "release" : "release_timeout");
         return removed ? kOwnedVirtualDisplayOk : kOwnedVirtualDisplayRestoreFailed;
     }
 }
