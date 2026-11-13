@@ -261,89 +261,11 @@ impl MouseControllable for Enigo {
     }
 
     fn mouse_down(&mut self, button: MouseButton) -> crate::ResultType {
-        let now = std::time::Instant::now();
-        if let Some(t) = self.last_click_time {
-            if t.elapsed().as_millis() as u32 <= self.double_click_interval {
-                self.multiple_click += 1;
-            } else {
-                self.multiple_click = 1;
-            }
-        }
-        self.last_click_time = Some(now);
-        let (current_x, current_y) = Self::mouse_location();
-        let (button, event_type, btn_value) = match button {
-            MouseButton::Left => (CGMouseButton::Left, CGEventType::LeftMouseDown, None),
-            MouseButton::Middle => (CGMouseButton::Center, CGEventType::OtherMouseDown, None),
-            MouseButton::Right => (CGMouseButton::Right, CGEventType::RightMouseDown, None),
-            MouseButton::Back => (
-                CGMouseButton::Left,
-                CGEventType::OtherMouseDown,
-                Some(MOUSE_EVENT_BUTTON_NUMBER_BACK),
-            ),
-            MouseButton::Forward => (
-                CGMouseButton::Left,
-                CGEventType::OtherMouseDown,
-                Some(MOUSE_EVENT_BUTTON_NUMBER_FORWARD),
-            ),
-            _ => {
-                log::info!("Unsupported button {:?}", button);
-                return Ok(());
-            }
-        };
-        let dest = CGPoint::new(current_x as f64, current_y as f64);
-        if let Some(src) = self.event_source.as_ref() {
-            if let Ok(event) = CGEvent::new_mouse_event(src.clone(), event_type, dest, button) {
-                if self.multiple_click > 1 {
-                    event.set_integer_value_field(
-                        EventField::MOUSE_EVENT_CLICK_STATE,
-                        self.multiple_click,
-                    );
-                }
-                if let Some(v) = btn_value {
-                    event.set_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER, v);
-                }
-                self.post(event, None);
-            }
-        }
-        Ok(())
+        self.mouse_down_at_location(button, None)
     }
 
     fn mouse_up(&mut self, button: MouseButton) {
-        let (current_x, current_y) = Self::mouse_location();
-        let (button, event_type, btn_value) = match button {
-            MouseButton::Left => (CGMouseButton::Left, CGEventType::LeftMouseUp, None),
-            MouseButton::Middle => (CGMouseButton::Center, CGEventType::OtherMouseUp, None),
-            MouseButton::Right => (CGMouseButton::Right, CGEventType::RightMouseUp, None),
-            MouseButton::Back => (
-                CGMouseButton::Left,
-                CGEventType::OtherMouseUp,
-                Some(MOUSE_EVENT_BUTTON_NUMBER_BACK),
-            ),
-            MouseButton::Forward => (
-                CGMouseButton::Left,
-                CGEventType::OtherMouseUp,
-                Some(MOUSE_EVENT_BUTTON_NUMBER_FORWARD),
-            ),
-            _ => {
-                log::info!("Unsupported button {:?}", button);
-                return;
-            }
-        };
-        let dest = CGPoint::new(current_x as f64, current_y as f64);
-        if let Some(src) = self.event_source.as_ref() {
-            if let Ok(event) = CGEvent::new_mouse_event(src.clone(), event_type, dest, button) {
-                if self.multiple_click > 1 {
-                    event.set_integer_value_field(
-                        EventField::MOUSE_EVENT_CLICK_STATE,
-                        self.multiple_click,
-                    );
-                }
-                if let Some(v) = btn_value {
-                    event.set_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER, v);
-                }
-                self.post(event, None);
-            }
-        }
+        self.mouse_up_at_location(button, None);
     }
 
     fn mouse_click(&mut self, button: MouseButton) {
@@ -479,6 +401,115 @@ impl KeyboardControllable for Enigo {
 }
 
 impl Enigo {
+    /// Post a button-down event at an explicit absolute desktop location.
+    /// This path does not read the current system cursor.
+    pub fn mouse_down_at(&mut self, button: MouseButton, x: i32, y: i32) -> crate::ResultType {
+        self.mouse_down_at_location(button, Some((x, y)))
+    }
+
+    /// Post a button-up event at an explicit absolute desktop location.
+    /// This path does not read the current system cursor.
+    pub fn mouse_up_at(&mut self, button: MouseButton, x: i32, y: i32) {
+        self.mouse_up_at_location(button, Some((x, y)));
+    }
+
+    fn mouse_down_at_location(
+        &mut self,
+        button: MouseButton,
+        location: Option<(i32, i32)>,
+    ) -> crate::ResultType {
+        let now = std::time::Instant::now();
+        if let Some(last_click_time) = self.last_click_time {
+            if last_click_time.elapsed().as_millis() as u32 <= self.double_click_interval {
+                self.multiple_click += 1;
+            } else {
+                self.multiple_click = 1;
+            }
+        }
+        self.last_click_time = Some(now);
+        let (x, y) = Self::resolve_mouse_button_location(location, Self::mouse_location);
+        if let Some(event) =
+            self.build_mouse_button_event(button, true, CGPoint::new(x as f64, y as f64))
+        {
+            self.post(event, None);
+        }
+        Ok(())
+    }
+
+    fn mouse_up_at_location(&mut self, button: MouseButton, location: Option<(i32, i32)>) {
+        let (x, y) = Self::resolve_mouse_button_location(location, Self::mouse_location);
+        if let Some(event) =
+            self.build_mouse_button_event(button, false, CGPoint::new(x as f64, y as f64))
+        {
+            self.post(event, None);
+        }
+    }
+
+    fn build_mouse_button_event(
+        &self,
+        button: MouseButton,
+        is_down: bool,
+        location: CGPoint,
+    ) -> Option<CGEvent> {
+        let (cg_button, event_type, button_value) = match button {
+            MouseButton::Left if is_down => (CGMouseButton::Left, CGEventType::LeftMouseDown, None),
+            MouseButton::Left => (CGMouseButton::Left, CGEventType::LeftMouseUp, None),
+            MouseButton::Middle if is_down => {
+                (CGMouseButton::Center, CGEventType::OtherMouseDown, None)
+            }
+            MouseButton::Middle => (CGMouseButton::Center, CGEventType::OtherMouseUp, None),
+            MouseButton::Right if is_down => {
+                (CGMouseButton::Right, CGEventType::RightMouseDown, None)
+            }
+            MouseButton::Right => (CGMouseButton::Right, CGEventType::RightMouseUp, None),
+            MouseButton::Back => (
+                CGMouseButton::Left,
+                if is_down {
+                    CGEventType::OtherMouseDown
+                } else {
+                    CGEventType::OtherMouseUp
+                },
+                Some(MOUSE_EVENT_BUTTON_NUMBER_BACK),
+            ),
+            MouseButton::Forward => (
+                CGMouseButton::Left,
+                if is_down {
+                    CGEventType::OtherMouseDown
+                } else {
+                    CGEventType::OtherMouseUp
+                },
+                Some(MOUSE_EVENT_BUTTON_NUMBER_FORWARD),
+            ),
+            _ => {
+                log::info!("Unsupported button {:?}", button);
+                return None;
+            }
+        };
+        let source = self.event_source.as_ref()?;
+        let event =
+            CGEvent::new_mouse_event(source.clone(), event_type, location, cg_button).ok()?;
+        if self.multiple_click > 1 {
+            event.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, self.multiple_click);
+        }
+        if let Some(value) = button_value {
+            event.set_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER, value);
+        }
+        Some(event)
+    }
+
+    fn resolve_mouse_button_location<F>(
+        location: Option<(i32, i32)>,
+        read_current_location: F,
+    ) -> (i32, i32)
+    where
+        F: FnOnce() -> (i32, i32),
+    {
+        match location {
+            Some(point) => point,
+            None => read_current_location(),
+        }
+    }
+
     fn pressed_buttons() -> usize {
         if let Some(ns_event) = Class::get("NSEvent") {
             unsafe { msg_send![ns_event, pressedMouseButtons] }
@@ -862,3 +893,44 @@ fn get_map(name: &str, layout: *const u8) -> Map<char, CGKeyCode> {
     map
 }
 unsafe impl Send for Enigo {}
+
+#[cfg(test)]
+mod explicit_mouse_button_location_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_button_point_does_not_read_current_cursor() {
+        let point = (739, 684);
+        let resolved = Enigo::resolve_mouse_button_location(Some(point), || {
+            panic!("explicit mouse point must not read the system cursor")
+        });
+        assert_eq!(resolved, point);
+    }
+
+    #[test]
+    fn legacy_button_path_still_reads_current_cursor() {
+        let mut read_current = false;
+        let resolved = Enigo::resolve_mouse_button_location(None, || {
+            read_current = true;
+            (12, 34)
+        });
+        assert!(read_current);
+        assert_eq!(resolved, (12, 34));
+    }
+
+    #[test]
+    fn button_event_preserves_explicit_cg_location() {
+        let enigo = Enigo::default();
+        let requested = CGPoint::new(739.0, 684.0);
+        for is_down in [true, false] {
+            let event = enigo.build_mouse_button_event(MouseButton::Left, is_down, requested);
+            assert!(event.is_some(), "CG button event should be constructible");
+            let Some(event) = event else {
+                panic!("CG button event should be constructible");
+            };
+            let actual = event.location();
+            assert_eq!(actual.x, requested.x);
+            assert_eq!(actual.y, requested.y);
+        }
+    }
+}

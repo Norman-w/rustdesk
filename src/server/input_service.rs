@@ -1056,6 +1056,48 @@ pub fn handle_mouse_(
     }
 }
 
+#[cfg(target_os = "macos")]
+fn mouse_button_down_event(en: &mut Enigo, button: MouseButton, evt: &MouseEvent, conn: i32) {
+    if evt.position_valid {
+        set_relative_mouse_active(conn, false);
+        allow_err!(en.mouse_down_at(button, evt.x, evt.y));
+        *LATEST_PEER_INPUT_CURSOR.lock().unwrap() = Input {
+            conn,
+            time: get_time(),
+            x: evt.x,
+            y: evt.y,
+        };
+    } else {
+        allow_err!(en.mouse_down(button));
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn mouse_button_up_event(en: &mut Enigo, button: MouseButton, evt: &MouseEvent, conn: i32) {
+    if evt.position_valid {
+        set_relative_mouse_active(conn, false);
+        en.mouse_up_at(button, evt.x, evt.y);
+        *LATEST_PEER_INPUT_CURSOR.lock().unwrap() = Input {
+            conn,
+            time: get_time(),
+            x: evt.x,
+            y: evt.y,
+        };
+    } else {
+        en.mouse_up(button);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn mouse_button_down_event(en: &mut Enigo, button: MouseButton, _evt: &MouseEvent, _conn: i32) {
+    allow_err!(en.mouse_down(button));
+}
+
+#[cfg(not(target_os = "macos"))]
+fn mouse_button_up_event(en: &mut Enigo, button: MouseButton, _evt: &MouseEvent, _conn: i32) {
+    en.mouse_up(button);
+}
+
 pub fn handle_mouse_simulation_(evt: &MouseEvent, conn: i32) {
     if !active_mouse_(conn) {
         return;
@@ -1134,37 +1176,37 @@ pub fn handle_mouse_simulation_(evt: &MouseEvent, conn: i32) {
         }
         MOUSE_TYPE_DOWN => match buttons {
             MOUSE_BUTTON_LEFT => {
-                allow_err!(en.mouse_down(MouseButton::Left));
+                mouse_button_down_event(&mut en, MouseButton::Left, evt, conn);
             }
             MOUSE_BUTTON_RIGHT => {
-                allow_err!(en.mouse_down(MouseButton::Right));
+                mouse_button_down_event(&mut en, MouseButton::Right, evt, conn);
             }
             MOUSE_BUTTON_WHEEL => {
-                allow_err!(en.mouse_down(MouseButton::Middle));
+                mouse_button_down_event(&mut en, MouseButton::Middle, evt, conn);
             }
             MOUSE_BUTTON_BACK => {
-                allow_err!(en.mouse_down(MouseButton::Back));
+                mouse_button_down_event(&mut en, MouseButton::Back, evt, conn);
             }
             MOUSE_BUTTON_FORWARD => {
-                allow_err!(en.mouse_down(MouseButton::Forward));
+                mouse_button_down_event(&mut en, MouseButton::Forward, evt, conn);
             }
             _ => {}
         },
         MOUSE_TYPE_UP => match buttons {
             MOUSE_BUTTON_LEFT => {
-                en.mouse_up(MouseButton::Left);
+                mouse_button_up_event(&mut en, MouseButton::Left, evt, conn);
             }
             MOUSE_BUTTON_RIGHT => {
-                en.mouse_up(MouseButton::Right);
+                mouse_button_up_event(&mut en, MouseButton::Right, evt, conn);
             }
             MOUSE_BUTTON_WHEEL => {
-                en.mouse_up(MouseButton::Middle);
+                mouse_button_up_event(&mut en, MouseButton::Middle, evt, conn);
             }
             MOUSE_BUTTON_BACK => {
-                en.mouse_up(MouseButton::Back);
+                mouse_button_up_event(&mut en, MouseButton::Back, evt, conn);
             }
             MOUSE_BUTTON_FORWARD => {
-                en.mouse_up(MouseButton::Forward);
+                mouse_button_up_event(&mut en, MouseButton::Forward, evt, conn);
             }
             _ => {}
         },
