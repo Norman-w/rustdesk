@@ -8,11 +8,12 @@ use super::owned_virtual_display::{
     normalize_target, ApplyAction, ApplyPlan, DisconnectPlan, LeaseBook, LeaseError,
     PendingFrameConfirmation, ReleasePlan, Target,
 };
+use hbb_common::log;
 use hbb_common::message_proto::{
     OwnedVirtualDisplayCapabilities, OwnedVirtualDisplayOperation, OwnedVirtualDisplayRequest,
     OwnedVirtualDisplayResult, OwnedVirtualDisplayStatus, Resolution,
 };
-use hbb_common::protobuf::{Enum, MessageField};
+use hbb_common::protobuf::{Enum, EnumOrUnknown, MessageField};
 use scrap::Display;
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -39,9 +40,11 @@ enum Command {
     },
     Frame {
         connection: u64,
+        display_id: u32,
         display_index: i32,
         width: u32,
         height: u32,
+        observed_at: Instant,
     },
 }
 
@@ -100,13 +103,22 @@ pub(super) fn disconnected(connection: i32) {
     }
 }
 
-pub(super) fn observe_frame(connection: i32, display_index: i32, width: u32, height: u32) {
+pub(super) fn observe_frame(
+    connection: i32,
+    display_id: u32,
+    display_index: i32,
+    width: u32,
+    height: u32,
+    observed_at: Instant,
+) {
     if let Some(sender) = MANAGER.get() {
         let _ = sender.send(Command::Frame {
             connection: connection.max(0) as u64,
+            display_id,
             display_index,
             width,
             height,
+            observed_at,
         });
     }
 }
@@ -147,6 +159,7 @@ struct WaitingForFrame {
     base: OwnedVirtualDisplayResult,
     emit: ResultEmitter,
     deadline: Instant,
+    confirmed_after: Instant,
 }
 
 struct Manager {
@@ -179,10 +192,19 @@ impl Manager {
                 Ok(Command::Disconnected { connection }) => self.handle_disconnect(connection),
                 Ok(Command::Frame {
                     connection,
+                    display_id,
                     display_index,
                     width,
                     height,
-                }) => self.handle_frame(connection, display_index, width, height),
+                    observed_at,
+                }) => self.handle_frame(
+                    connection,
+                    display_id,
+                    display_index,
+                    width,
+                    height,
+                    observed_at,
+                ),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => return,
             }
@@ -553,6 +575,9 @@ impl Manager {
             );
         }
         emit_result(&emit, applied.clone());
+        // Frame observations queued while native apply/display enumeration was
+        // blocking the manager must not confirm this request after it resumes.
+        let confirmed_after = Instant::now();
         let width = applied
             .actual
             .as_ref()
@@ -572,6 +597,7 @@ impl Manager {
                     Ok(OwnedVirtualDisplayOperation::OWNED_DISPLAY_OPERATION_RELEASE) => 2,
                     _ => 1,
                 },
+                display_id: applied.display_id,
                 display_index: applied.display_index,
                 width,
                 height,
@@ -595,17 +621,29 @@ impl Manager {
                 base: applied,
                 emit,
                 deadline: Instant::now() + FRAME_CONFIRMATION_TIMEOUT,
+                confirmed_after,
             },
         );
     }
 
-    fn handle_frame(&mut self, connection: u64, display_index: i32, width: u32, height: u32) {
+    fn handle_frame(
+        &mut self,
+        connection: u64,
+        display_id: u32,
+        display_index: i32,
+        width: u32,
+        height: u32,
+        observed_at: Instant,
+    ) {
         let Some(waiting) = self.waiting.get(&connection) else {
             return;
         };
+        if observed_at <= waiting.confirmed_after {
+            return;
+        }
         if !waiting
             .confirmation
-            .matches_frame(display_index, width, height)
+            .matches_frame(display_id, display_index, width, height)
         {
             return;
         }
@@ -925,8 +963,8 @@ fn result_for(
     let mut result = OwnedVirtualDisplayResult::new();
     result.request_id = request.request_id;
     result.generation = request.generation;
-    result.set_operation(request.operation.value());
-    result.set_status(status);
+    result.operation = request.operation.clone();
+    result.status = EnumOrUnknown::new(status);
     result.lease_id = lease_id;
     result.requested = request.requested.clone();
     if let Some(target) = normalized {
@@ -955,7 +993,7 @@ fn result_with_status(
     error_code: i32,
     message: &str,
 ) -> OwnedVirtualDisplayResult {
-    result.set_status(status);
+    result.status = EnumOrUnknown::new(status);
     result.error_code = error_code;
     result.error_message = message.to_owned();
     result
@@ -992,5 +1030,145 @@ fn native_status_to_protocol(status: i32) -> OwnedVirtualDisplayStatus {
             OwnedVirtualDisplayStatus::OWNED_DISPLAY_STATUS_TIMED_OUT
         }
         _ => OwnedVirtualDisplayStatus::OWNED_DISPLAY_STATUS_FAILED,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hbb_common::message_proto::OwnedVirtualDisplayOperation;
+    use std::sync::Mutex;
+
+    fn request(request_id: u64) -> OwnedVirtualDisplayRequest {
+        OwnedVirtualDisplayRequest {
+            request_id,
+            generation: 1,
+            operation: EnumOrUnknown::new(
+                OwnedVirtualDisplayOperation::OWNED_DISPLAY_OPERATION_APPLY,
+            ),
+            ..Default::default()
+        }
+    }
+
+    fn emitter() -> (ResultEmitter, Arc<Mutex<Vec<OwnedVirtualDisplayResult>>>) {
+        let results = Arc::new(Mutex::new(Vec::new()));
+        let output = results.clone();
+        let emit: ResultEmitter = Arc::new(move |result| {
+            output.lock().unwrap().push(result);
+        });
+        (emit, results)
+    }
+
+    fn applied_result(
+        request: &OwnedVirtualDisplayRequest,
+        lease_id: u64,
+    ) -> OwnedVirtualDisplayResult {
+        result_for(
+            request,
+            OwnedVirtualDisplayStatus::OWNED_DISPLAY_STATUS_APPLIED,
+            lease_id,
+            Some(Target {
+                requested_width: 1280,
+                requested_height: 800,
+                normalized_width: 1280,
+                normalized_height: 800,
+            }),
+            Some((1280, 800)),
+            42,
+            2,
+            "applied in test",
+        )
+    }
+
+    #[test]
+    fn queued_pre_apply_and_wrong_display_frames_cannot_confirm() {
+        let connection = 10;
+        let request = request(1);
+        let (emit, results) = emitter();
+        let mut manager = Manager::new();
+        let queued_before_apply = Instant::now();
+
+        manager.arm_frame_confirmation(
+            connection,
+            request.clone(),
+            emit,
+            applied_result(&request, 7),
+        );
+        let confirmed_after = manager.waiting[&connection].confirmed_after;
+        manager.handle_frame(connection, 42, 2, 1280, 800, queued_before_apply);
+        manager.handle_frame(
+            connection,
+            41,
+            2,
+            1280,
+            800,
+            confirmed_after + Duration::from_millis(1),
+        );
+        assert!(manager.waiting.contains_key(&connection));
+        assert_eq!(results.lock().unwrap().len(), 1);
+
+        manager.handle_frame(
+            connection,
+            42,
+            2,
+            1280,
+            800,
+            confirmed_after + Duration::from_millis(2),
+        );
+        assert!(!manager.waiting.contains_key(&connection));
+        let results = results.lock().unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results[1].status.enum_value().unwrap(),
+            OwnedVirtualDisplayStatus::OWNED_DISPLAY_STATUS_CONFIRMED
+        );
+    }
+
+    #[test]
+    fn same_target_shared_lease_confirms_for_the_new_connection() {
+        let target = Target {
+            requested_width: 1280,
+            requested_height: 800,
+            normalized_width: 1280,
+            normalized_height: 800,
+        };
+        let mut manager = Manager::new();
+        let first = manager.leases.plan_apply(10, 1, 1, 0, target).unwrap();
+        manager.leases.commit_apply(first);
+        manager.active = Some(ActiveDisplay {
+            display_id: 42,
+            display_index: 2,
+            width: 1280,
+            height: 800,
+        });
+
+        // This is the same-target shared lease path used for a second live
+        // connection; it does not recreate the CG display.
+        let second_connection = 11;
+        let shared = manager
+            .leases
+            .plan_apply(second_connection, 1, 1, 0, target)
+            .unwrap();
+        assert_eq!(shared.action, ApplyAction::Share);
+        manager.leases.commit_apply(shared);
+        let request = request(1);
+        let (emit, results) = emitter();
+        manager.arm_frame_confirmation(
+            second_connection,
+            request.clone(),
+            emit,
+            applied_result(&request, shared.lease_id),
+        );
+
+        let observed_after =
+            manager.waiting[&second_connection].confirmed_after + Duration::from_millis(1);
+        manager.handle_frame(second_connection, 42, 2, 1280, 800, observed_after);
+        let results = results.lock().unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[1].lease_id, shared.lease_id);
+        assert_eq!(
+            results[1].status.enum_value().unwrap(),
+            OwnedVirtualDisplayStatus::OWNED_DISPLAY_STATUS_CONFIRMED
+        );
     }
 }

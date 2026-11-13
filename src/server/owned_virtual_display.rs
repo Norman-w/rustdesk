@@ -427,14 +427,24 @@ pub struct PendingFrameConfirmation {
     pub generation: u64,
     pub lease_id: u64,
     pub operation: u8,
+    pub display_id: u32,
     pub display_index: i32,
     pub width: u32,
     pub height: u32,
 }
 
 impl PendingFrameConfirmation {
-    pub fn matches_frame(&self, display_index: i32, width: u32, height: u32) -> bool {
-        display_index == self.display_index && width == self.width && height == self.height
+    pub fn matches_frame(
+        &self,
+        display_id: u32,
+        display_index: i32,
+        width: u32,
+        height: u32,
+    ) -> bool {
+        display_id == self.display_id
+            && display_index == self.display_index
+            && width == self.width
+            && height == self.height
     }
 }
 
@@ -620,12 +630,14 @@ mod tests {
             generation: 3,
             lease_id: 22,
             operation: 1,
+            display_id: 42,
             display_index: 2,
             width: 1234,
             height: 986,
         };
-        assert!(!pending.matches_frame(1, 1234, 986));
-        assert!(!pending.matches_frame(2, 1234, 987));
-        assert!(pending.matches_frame(2, 1234, 986));
+        assert!(!pending.matches_frame(42, 1, 1234, 986));
+        assert!(!pending.matches_frame(42, 2, 1234, 987));
+        assert!(!pending.matches_frame(41, 2, 1234, 986));
+        assert!(pending.matches_frame(42, 2, 1234, 986));
     }
 }

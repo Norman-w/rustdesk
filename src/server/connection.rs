@@ -434,30 +434,41 @@ impl ConnInner {
     }
 
     #[cfg(target_os = "macos")]
-    fn owned_display_frame_observation(&self, message: &Message) -> Option<(i32, u32, u32)> {
-        let Some(message::Union::VideoFrame(frame)) = message.union.as_ref() else {
-            return None;
+    fn update_display_sizes(&self, message: &Message) {
+        let Some(union) = message.union.as_ref() else {
+            return;
         };
-        let has_payload = match frame.union.as_ref() {
-            Some(video_frame::Union::Vp9s(frames))
-            | Some(video_frame::Union::H264s(frames))
-            | Some(video_frame::Union::H265s(frames))
-            | Some(video_frame::Union::Vp8s(frames))
-            | Some(video_frame::Union::Av1s(frames)) => {
-                frames.frames.iter().any(|frame| !frame.data.is_empty())
+        let Ok(mut sizes) = self.display_sizes.lock() else {
+            return;
+        };
+        match union {
+            message::Union::PeerInfo(peer_info) => {
+                // PeerInfo is the complete display snapshot sent to a newly
+                // subscribed connection. Replace the map so removed/reordered
+                // indices cannot leave stale dimensions behind.
+                sizes.clear();
+                for (index, display) in peer_info.displays.iter().enumerate() {
+                    if let (Ok(width), Ok(height)) =
+                        (u32::try_from(display.width), u32::try_from(display.height))
+                    {
+                        if width > 0 && height > 0 {
+                            sizes.insert(index as i32, (width, height));
+                        }
+                    }
+                }
             }
-            _ => false,
-        };
-        if !has_payload || frame.display < 0 {
-            return None;
+            message::Union::Misc(misc) => {
+                if let Some(misc::Union::SwitchDisplay(display)) = misc.union.as_ref() {
+                    if display.display >= 0 && display.width > 0 && display.height > 0 {
+                        sizes.insert(
+                            display.display,
+                            (display.width as u32, display.height as u32),
+                        );
+                    }
+                }
+            }
+            _ => {}
         }
-        let (width, height) = self
-            .display_sizes
-            .lock()
-            .ok()?
-            .get(&frame.display)
-            .copied()?;
-        (width > 0 && height > 0).then_some((frame.display, width, height))
     }
 }
 
@@ -470,20 +481,7 @@ impl Subscriber for ConnInner {
     #[inline]
     fn send(&mut self, msg: Arc<Message>) {
         #[cfg(target_os = "macos")]
-        if let Some(message::Union::Misc(misc)) = msg.union.as_ref() {
-            if let Some(misc::Union::SwitchDisplay(display)) = misc.union.as_ref() {
-                if display.display >= 0 && display.width > 0 && display.height > 0 {
-                    if let Ok(mut sizes) = self.display_sizes.lock() {
-                        sizes.insert(
-                            display.display,
-                            (display.width as u32, display.height as u32),
-                        );
-                    }
-                }
-            }
-        }
-        #[cfg(target_os = "macos")]
-        let frame_observation = self.owned_display_frame_observation(msg.as_ref());
+        self.update_display_sizes(msg.as_ref());
         // Send SwitchDisplay on the same channel as VideoFrame to avoid send order problems.
         let tx_by_video = match &msg.union {
             Some(message::Union::VideoFrame(_)) => true,
@@ -494,25 +492,13 @@ impl Subscriber for ConnInner {
             },
             _ => false,
         };
-        let sent = if tx_by_video {
-            self.tx_video
-                .as_ref()
-                .is_some_and(|tx| tx.send((Instant::now(), msg)).is_ok())
+        let tx = if tx_by_video {
+            self.tx_video.as_ref()
         } else {
-            self.tx
-                .as_ref()
-                .is_some_and(|tx| tx.send((Instant::now(), msg)).is_ok())
+            self.tx.as_ref()
         };
-        if sent {
-            #[cfg(target_os = "macos")]
-            if let Some((display_index, width, height)) = frame_observation {
-                super::owned_virtual_display_runtime::observe_frame(
-                    self.id,
-                    display_index,
-                    width,
-                    height,
-                );
-            }
+        if let Some(tx) = tx {
+            let _ = tx.send((Instant::now(), msg));
         }
     }
 }
@@ -6992,6 +6978,29 @@ mod test {
         let pos = msg.cursor_position();
         assert_eq!(pos.x, 510);
         assert_eq!(pos.y, 510);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn new_subscriber_peer_info_replaces_display_size_snapshot() {
+        let mut conn = ConnInner::new(77, None, None);
+        conn.display_sizes.lock().unwrap().insert(4, (640, 480));
+        let mut peer_info = PeerInfo::new();
+        peer_info.displays.push(DisplayInfo {
+            width: 1280,
+            height: 800,
+            ..Default::default()
+        });
+        let mut message = Message::new();
+        message.set_peer_info(peer_info);
+
+        // Exercise the existing protocol dispatch used by display_service for
+        // a new subscriber, rather than a test-only map update helper.
+        conn.send(Arc::new(message));
+
+        let sizes = conn.display_sizes.lock().unwrap();
+        assert_eq!(sizes.get(&0), Some(&(1280, 800)));
+        assert!(!sizes.contains_key(&4));
     }
 
     #[test]
