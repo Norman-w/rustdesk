@@ -70,6 +70,8 @@ mod connection;
 mod login_failure_check;
 pub mod display_service;
 pub mod owned_virtual_display;
+#[cfg(target_os = "macos")]
+mod owned_virtual_display_runtime;
 #[cfg(windows)]
 pub mod portable_service;
 mod service;

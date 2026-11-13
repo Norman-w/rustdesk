@@ -135,6 +135,12 @@ pub struct ApplyPlan {
     previous_target: Option<(u32, u32)>,
 }
 
+impl ApplyPlan {
+    pub fn previous_target(&self) -> Option<(u32, u32)> {
+        self.previous_target
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReleasePlan {
     pub connection: u64,
@@ -162,6 +168,7 @@ pub struct LeaseBook {
     leases: HashMap<u64, Lease>,
     next_lease_id: u64,
     next_native_generation: u64,
+    active_native_generation: Option<u64>,
     requests: RequestOrderBook,
 }
 
@@ -184,6 +191,30 @@ impl LeaseBook {
             .checked_add(1)
             .ok_or(LeaseError::NativeGenerationExhausted)?;
         Ok(self.next_native_generation)
+    }
+
+    pub fn reserve_recovery_native_generation(&mut self) -> Result<u64, LeaseError> {
+        self.next_native_generation()
+    }
+
+    pub fn set_recovered_native_generation(&mut self, generation: u64) {
+        self.next_native_generation = self.next_native_generation.max(generation);
+        self.active_native_generation = Some(generation);
+    }
+
+    pub fn clear_lease_after_native_loss(&mut self, connection: u64, lease_id: u64) -> bool {
+        if !self
+            .leases
+            .get(&connection)
+            .is_some_and(|lease| lease.id == lease_id)
+        {
+            return false;
+        }
+        self.leases.remove(&connection);
+        if self.leases.is_empty() {
+            self.active_native_generation = None;
+        }
+        true
     }
 
     fn check_order(
@@ -267,6 +298,9 @@ impl LeaseBook {
     }
 
     pub fn commit_apply(&mut self, plan: ApplyPlan) {
+        if plan.action != ApplyAction::Share {
+            self.active_native_generation = Some(plan.native_generation);
+        }
         self.leases.insert(
             plan.connection,
             Lease {
@@ -319,7 +353,9 @@ impl LeaseBook {
             self.leases.remove(&connection);
             return Ok(None);
         }
-        let native_generation = self.next_native_generation()?;
+        let native_generation = self
+            .active_native_generation
+            .ok_or(LeaseError::NativeGenerationExhausted)?;
         Ok(Some(ReleasePlan {
             connection,
             request_id,
@@ -330,12 +366,14 @@ impl LeaseBook {
     }
 
     pub fn commit_release(&mut self, plan: ReleasePlan) {
-        if self
-            .leases
-            .get(&plan.connection)
-            .is_some_and(|lease| lease.id == plan.lease_id)
+        if self.active_native_generation == Some(plan.native_generation)
+            && self
+                .leases
+                .get(&plan.connection)
+                .is_some_and(|lease| lease.id == plan.lease_id)
         {
             self.leases.remove(&plan.connection);
+            self.active_native_generation = None;
         }
     }
 
@@ -356,7 +394,9 @@ impl LeaseBook {
             self.leases.remove(&connection);
             return Ok(None);
         }
-        let native_generation = self.next_native_generation()?;
+        let native_generation = self
+            .active_native_generation
+            .ok_or(LeaseError::NativeGenerationExhausted)?;
         Ok(Some(DisconnectPlan {
             connection,
             lease_id: lease.id,
@@ -365,12 +405,14 @@ impl LeaseBook {
     }
 
     pub fn commit_disconnect(&mut self, plan: DisconnectPlan) {
-        if self
-            .leases
-            .get(&plan.connection)
-            .is_some_and(|lease| lease.id == plan.lease_id)
+        if self.active_native_generation == Some(plan.native_generation)
+            && self
+                .leases
+                .get(&plan.connection)
+                .is_some_and(|lease| lease.id == plan.lease_id)
         {
             self.leases.remove(&plan.connection);
+            self.active_native_generation = None;
         }
     }
 
@@ -416,12 +458,12 @@ mod tests {
     #[test]
     fn odd_pixel_target_is_reported_as_requested_and_normalized() {
         assert_eq!(
-            target(2210, 1877),
+            target(1235, 987),
             Target {
-                requested_width: 2210,
-                requested_height: 1877,
-                normalized_width: 2210,
-                normalized_height: 1876,
+                requested_width: 1235,
+                requested_height: 987,
+                normalized_width: 1234,
+                normalized_height: 986,
             }
         );
     }
@@ -473,7 +515,7 @@ mod tests {
             .plan_release(11, 2, 2, second.lease_id)
             .unwrap()
             .unwrap();
-        assert_eq!(last.native_generation, 2);
+        assert_eq!(last.native_generation, first.native_generation);
         book.commit_release(last);
         assert_eq!(book.owner_count(), 0);
         assert_eq!(book.target(), None);
@@ -545,9 +587,30 @@ mod tests {
         book.rollback_disconnect(last);
         assert_eq!(book.owner_count(), 1);
         let retry = book.plan_disconnect(11).unwrap().unwrap();
-        assert!(retry.native_generation > last.native_generation);
+        assert_eq!(retry.native_generation, last.native_generation);
         book.commit_disconnect(retry);
         assert_eq!(book.owner_count(), 0);
+    }
+
+    #[test]
+    fn delayed_release_plan_cannot_remove_a_resized_current_lease() {
+        let mut book = LeaseBook::default();
+        let first = book.plan_apply(10, 1, 1, 0, target(1600, 900)).unwrap();
+        book.commit_apply(first);
+        let delayed_release = book
+            .plan_release(10, 2, 2, first.lease_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(delayed_release.native_generation, first.native_generation);
+
+        let resize = book
+            .plan_apply(10, 3, 3, first.lease_id, target(900, 1600))
+            .unwrap();
+        book.commit_apply(resize);
+        book.commit_release(delayed_release);
+        assert_eq!(book.owner_count(), 1);
+        assert_eq!(book.lease_id(10), Some(first.lease_id));
+        assert_eq!(book.target(), Some((900, 1600)));
     }
 
     #[test]
@@ -558,11 +621,11 @@ mod tests {
             lease_id: 22,
             operation: 1,
             display_index: 2,
-            width: 2210,
-            height: 1876,
+            width: 1234,
+            height: 986,
         };
-        assert!(!pending.matches_frame(1, 2210, 1876));
-        assert!(!pending.matches_frame(2, 2210, 1877));
-        assert!(pending.matches_frame(2, 2210, 1876));
+        assert!(!pending.matches_frame(1, 1234, 986));
+        assert!(!pending.matches_frame(2, 1234, 987));
+        assert!(pending.matches_frame(2, 1234, 986));
     }
 }

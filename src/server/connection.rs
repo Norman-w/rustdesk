@@ -182,6 +182,8 @@ pub struct ConnInner {
     id: i32,
     tx: Option<Sender>,
     tx_video: Option<Sender>,
+    #[cfg(target_os = "macos")]
+    display_sizes: Arc<Mutex<std::collections::HashMap<i32, (u32, u32)>>>,
 }
 
 struct InputMouse {
@@ -411,7 +413,51 @@ pub struct Connection {
 
 impl ConnInner {
     pub fn new(id: i32, tx: Option<Sender>, tx_video: Option<Sender>) -> Self {
-        Self { id, tx, tx_video }
+        Self {
+            id,
+            tx,
+            tx_video,
+            #[cfg(target_os = "macos")]
+            display_sizes: Arc::default(),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn send_owned_display_result(&self, result: OwnedVirtualDisplayResult) {
+        let mut misc = Misc::new();
+        misc.set_owned_virtual_display_result(result);
+        let mut message = Message::new();
+        message.set_misc(misc);
+        if let Some(tx) = &self.tx_video {
+            let _ = tx.send((Instant::now(), Arc::new(message)));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn owned_display_frame_observation(&self, message: &Message) -> Option<(i32, u32, u32)> {
+        let Some(message::Union::VideoFrame(frame)) = message.union.as_ref() else {
+            return None;
+        };
+        let has_payload = match frame.union.as_ref() {
+            Some(video_frame::Union::Vp9s(frames))
+            | Some(video_frame::Union::H264s(frames))
+            | Some(video_frame::Union::H265s(frames))
+            | Some(video_frame::Union::Vp8s(frames))
+            | Some(video_frame::Union::Av1s(frames)) => {
+                frames.frames.iter().any(|frame| !frame.data.is_empty())
+            }
+            _ => false,
+        };
+        if !has_payload || frame.display < 0 {
+            return None;
+        }
+        let (width, height) = self
+            .display_sizes
+            .lock()
+            .ok()?
+            .get(&frame.display)
+            .copied()?;
+        (width > 0 && height > 0).then_some((frame.display, width, height))
     }
 }
 
@@ -423,23 +469,51 @@ impl Subscriber for ConnInner {
 
     #[inline]
     fn send(&mut self, msg: Arc<Message>) {
+        #[cfg(target_os = "macos")]
+        if let Some(message::Union::Misc(misc)) = msg.union.as_ref() {
+            if let Some(misc::Union::SwitchDisplay(display)) = misc.union.as_ref() {
+                if display.display >= 0 && display.width > 0 && display.height > 0 {
+                    if let Ok(mut sizes) = self.display_sizes.lock() {
+                        sizes.insert(
+                            display.display,
+                            (display.width as u32, display.height as u32),
+                        );
+                    }
+                }
+            }
+        }
+        #[cfg(target_os = "macos")]
+        let frame_observation = self.owned_display_frame_observation(msg.as_ref());
         // Send SwitchDisplay on the same channel as VideoFrame to avoid send order problems.
         let tx_by_video = match &msg.union {
             Some(message::Union::VideoFrame(_)) => true,
             Some(message::Union::Misc(misc)) => match &misc.union {
                 Some(misc::Union::SwitchDisplay(_)) => true,
+                Some(misc::Union::OwnedVirtualDisplayResult(_)) => true,
                 _ => false,
             },
             _ => false,
         };
-        let tx = if tx_by_video {
-            self.tx_video.as_mut()
+        let sent = if tx_by_video {
+            self.tx_video
+                .as_ref()
+                .is_some_and(|tx| tx.send((Instant::now(), msg)).is_ok())
         } else {
-            self.tx.as_mut()
+            self.tx
+                .as_ref()
+                .is_some_and(|tx| tx.send((Instant::now(), msg)).is_ok())
         };
-        tx.map(|tx| {
-            allow_err!(tx.send((Instant::now(), msg)));
-        });
+        if sent {
+            #[cfg(target_os = "macos")]
+            if let Some((display_index, width, height)) = frame_observation {
+                super::owned_virtual_display_runtime::observe_frame(
+                    self.id,
+                    display_index,
+                    width,
+                    height,
+                );
+            }
+        }
     }
 }
 
@@ -504,6 +578,8 @@ impl Connection {
                 id,
                 tx: Some(tx),
                 tx_video: Some(tx_video),
+                #[cfg(target_os = "macos")]
+                display_sizes: Arc::default(),
             },
             require_2fa: crate::auth_2fa::get_2fa(None),
             display_idx: *display_service::PRIMARY_DISPLAY_IDX,
@@ -1915,6 +1991,13 @@ impl Connection {
                                 .unwrap_or(vec![]),
                             ..Default::default()
                         })
+                        .into();
+                    }
+                    #[cfg(target_os = "macos")]
+                    {
+                        pi.owned_virtual_display = Some(
+                            super::owned_virtual_display_runtime::capabilities(self.keyboard),
+                        )
                         .into();
                     }
                     res.set_peer_info(pi);
@@ -3465,6 +3548,9 @@ impl Connection {
                     _ => {}
                 },
                 Some(message::Union::Misc(misc)) => match misc.union {
+                    Some(misc::Union::OwnedVirtualDisplayRequest(request)) => {
+                        self.handle_owned_virtual_display_request(request);
+                    }
                     Some(misc::Union::SwitchDisplay(s)) => {
                         self.handle_switch_display(s).await;
                     }
@@ -4373,6 +4459,59 @@ impl Connection {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    fn handle_owned_virtual_display_request(&self, request: OwnedVirtualDisplayRequest) {
+        let inner = self.inner.clone();
+        let emit: super::owned_virtual_display_runtime::ResultEmitter =
+            Arc::new(move |result| inner.send_owned_display_result(result));
+        if !self.authorized || !self.is_remote() {
+            super::owned_virtual_display_runtime::reject(
+                &request,
+                &emit,
+                OwnedVirtualDisplayStatus::OWNED_DISPLAY_STATUS_UNSUPPORTED,
+                -10,
+                "owned display is limited to authenticated remote sessions",
+            );
+            return;
+        }
+        match request.operation.enum_value() {
+            Ok(OwnedVirtualDisplayOperation::OWNED_DISPLAY_OPERATION_APPLY)
+                if !self.keyboard =>
+            {
+                super::owned_virtual_display_runtime::reject(
+                    &request,
+                    &emit,
+                    OwnedVirtualDisplayStatus::OWNED_DISPLAY_STATUS_PERMISSION_DENIED,
+                    -11,
+                    "display control permission is disabled",
+                );
+            }
+            Ok(OwnedVirtualDisplayOperation::OWNED_DISPLAY_OPERATION_APPLY)
+            | Ok(OwnedVirtualDisplayOperation::OWNED_DISPLAY_OPERATION_RELEASE) => {
+                if !super::owned_virtual_display_runtime::submit(
+                    self.inner.id(),
+                    request.clone(),
+                    emit.clone(),
+                ) {
+                    super::owned_virtual_display_runtime::reject(
+                        &request,
+                        &emit,
+                        OwnedVirtualDisplayStatus::OWNED_DISPLAY_STATUS_FAILED,
+                        -12,
+                        "owned display worker is unavailable",
+                    );
+                }
+            }
+            _ => super::owned_virtual_display_runtime::reject(
+                &request,
+                &emit,
+                OwnedVirtualDisplayStatus::OWNED_DISPLAY_STATUS_UNSUPPORTED,
+                -13,
+                "unknown owned display operation",
+            ),
+        }
+    }
+
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn change_resolution(&mut self, d: Option<usize>, r: &Resolution) {
         if self.keyboard {
@@ -4897,6 +5036,8 @@ impl Connection {
             return;
         }
         self.closed = true;
+        #[cfg(target_os = "macos")]
+        super::owned_virtual_display_runtime::disconnected(self.inner.id());
         // If voice A,B -> C, and A,B has voice call
         // B disconnects, C will reset the voice call input.
         //
@@ -5761,6 +5902,12 @@ impl Connection {
     fn misc_message_family(misc: &Misc) -> &'static str {
         match misc.union.as_ref() {
             Some(misc::Union::ChatMessage(_)) => "misc.chat_message",
+            Some(misc::Union::OwnedVirtualDisplayRequest(_)) => {
+                "misc.owned_virtual_display_request"
+            }
+            Some(misc::Union::OwnedVirtualDisplayResult(_)) => {
+                "misc.owned_virtual_display_result"
+            }
             Some(misc::Union::SwitchDisplay(_)) => "misc.switch_display",
             Some(misc::Union::Option(_)) => "misc.option",
             Some(misc::Union::AudioFormat(_)) => "misc.audio_format",
@@ -6399,6 +6546,9 @@ impl Drop for Connection {
     fn drop(&mut self) {
         #[cfg(target_os = "macos")]
         self.end_remote_mic_route();
+
+        #[cfg(target_os = "macos")]
+        super::owned_virtual_display_runtime::disconnected(self.inner.id());
 
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         self.release_pressed_modifiers();
