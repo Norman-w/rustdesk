@@ -5,9 +5,13 @@
 #include <Security/AuthorizationTags.h>
 
 #include <CoreGraphics/CoreGraphics.h>
+#include <CoreGraphics/CGSession.h>
 #include <CoreAudio/CoreAudio.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <dispatch/dispatch.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #include <vector>
 #include <map>
 #include <set>
@@ -20,6 +24,8 @@
 #include <cmath>
 #include <cstdlib>
 #include <utility>
+
+extern char **environ;
 
 // Private CoreGraphics runtime interfaces used for an explicitly requested,
 // session-owned headless display. Keep these declarations local to this file.
@@ -819,8 +825,76 @@ struct OwnedVirtualDisplayState {
 // session-owned display operation can return to the user's existing full
 // screen Space without trying to infer a window or an app-specific layout.
 struct FrontmostApplicationSnapshot {
+    uid_t uid = 0;
     pid_t pid = 0;
 };
+
+bool ConsoleUserUID(uid_t *uidOut) {
+    if (uidOut == nullptr) return false;
+    *uidOut = 0;
+    CFDictionaryRef session = CGSessionCopyCurrentDictionary();
+    if (session == nullptr) return false;
+    CFTypeRef onConsole = CFDictionaryGetValue(session, kCGSessionOnConsoleKey);
+    bool onConsoleValue = onConsole == nullptr ||
+        (CFGetTypeID(onConsole) == CFBooleanGetTypeID() &&
+         CFBooleanGetValue(static_cast<CFBooleanRef>(onConsole)));
+    CFTypeRef userID = CFDictionaryGetValue(session, kCGSessionUserIDKey);
+    int32_t value = 0;
+    bool valid = onConsoleValue && userID != nullptr &&
+        CFGetTypeID(userID) == CFNumberGetTypeID() &&
+        CFNumberGetValue(static_cast<CFNumberRef>(userID), kCFNumberSInt32Type, &value) &&
+        value > 0;
+    if (valid) *uidOut = static_cast<uid_t>(value);
+    CFRelease(session);
+    return valid;
+}
+
+bool RunAsConsoleUserAppleScript(uid_t uid, const std::string &script, std::string *output) {
+    if (uid == 0 || script.empty()) return false;
+    int pipeFDs[2] = {-1, -1};
+    if (pipe(pipeFDs) != 0) return false;
+
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_adddup2(&actions, pipeFDs[1], STDOUT_FILENO);
+    posix_spawn_file_actions_adddup2(&actions, pipeFDs[1], STDERR_FILENO);
+    posix_spawn_file_actions_addclose(&actions, pipeFDs[0]);
+    posix_spawn_file_actions_addclose(&actions, pipeFDs[1]);
+
+    std::string uidString = std::to_string(uid);
+    char *argv[] = {
+        const_cast<char*>("/bin/launchctl"),
+        const_cast<char*>("asuser"),
+        const_cast<char*>(uidString.c_str()),
+        const_cast<char*>("/usr/bin/osascript"),
+        const_cast<char*>("-e"),
+        const_cast<char*>(script.c_str()),
+        nullptr,
+    };
+    pid_t child = 0;
+    int spawnStatus = posix_spawn(&child, "/bin/launchctl", &actions, nullptr, argv, environ);
+    posix_spawn_file_actions_destroy(&actions);
+    close(pipeFDs[1]);
+    if (spawnStatus != 0) {
+        close(pipeFDs[0]);
+        return false;
+    }
+
+    std::string captured;
+    char buffer[256];
+    ssize_t readCount = 0;
+    while ((readCount = read(pipeFDs[0], buffer, sizeof(buffer))) > 0) {
+        captured.append(buffer, static_cast<size_t>(readCount));
+    }
+    close(pipeFDs[0]);
+    int childStatus = 0;
+    if (waitpid(child, &childStatus, 0) != child ||
+        !WIFEXITED(childStatus) || WEXITSTATUS(childStatus) != 0) {
+        return false;
+    }
+    if (output != nullptr) *output = captured;
+    return true;
+}
 
 FrontmostApplicationSnapshot CaptureFrontmostApplication() {
     __block pid_t pid = 0;
@@ -833,12 +907,28 @@ FrontmostApplicationSnapshot CaptureFrontmostApplication() {
             }
         }
     };
+    uid_t uid = 0;
+    if (ConsoleUserUID(&uid)) {
+        std::string output;
+        if (RunAsConsoleUserAppleScript(
+                uid,
+                "tell application \"System Events\" to get unix id of first process whose frontmost is true",
+                &output)) {
+            char *end = nullptr;
+            long parsed = std::strtol(output.c_str(), &end, 10);
+            if (end != output.c_str() && parsed > 0 && parsed <= INT32_MAX) {
+                NSLog(@"Owned virtual display: captured console frontmost pid=%ld uid=%u",
+                      parsed, static_cast<unsigned>(uid));
+                return FrontmostApplicationSnapshot{uid, static_cast<pid_t>(parsed)};
+            }
+        }
+    }
     if ([NSThread isMainThread]) {
         capture();
     } else {
         dispatch_sync(dispatch_get_main_queue(), capture);
     }
-    return FrontmostApplicationSnapshot{pid};
+    return FrontmostApplicationSnapshot{uid, pid};
 }
 
 void RestoreFrontmostApplication(const FrontmostApplicationSnapshot &snapshot,
@@ -853,6 +943,21 @@ void RestoreFrontmostApplication(const FrontmostApplicationSnapshot &snapshot,
         dispatch_get_main_queue(),
         ^{
             @autoreleasepool {
+                if (snapshot.uid > 0) {
+                    std::string script =
+                        "tell application \"System Events\" to set frontmost of (first process whose unix id is " +
+                        std::to_string(snapshot.pid) + ") to true";
+                    std::string output;
+                    if (RunAsConsoleUserAppleScript(snapshot.uid, script, &output)) {
+                        NSLog(@"Owned virtual display: restored console frontmost application pid=%d uid=%u (%s)",
+                              snapshot.pid, static_cast<unsigned>(snapshot.uid),
+                              reason == nullptr ? "unknown" : reason);
+                        return;
+                    }
+                    NSLog(@"Owned virtual display: console frontmost restore failed pid=%d uid=%u (%s)",
+                          snapshot.pid, static_cast<unsigned>(snapshot.uid),
+                          reason == nullptr ? "unknown" : reason);
+                }
                 NSRunningApplication *application =
                     [NSRunningApplication runningApplicationWithProcessIdentifier:snapshot.pid];
                 if (application == nil || application.terminated) {
