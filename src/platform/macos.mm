@@ -768,7 +768,7 @@ enum OwnedVirtualDisplayStatus : int32_t {
     kOwnedVirtualDisplayStaleGeneration = 5,
     kOwnedVirtualDisplayCreateFailed = 6,
     kOwnedVirtualDisplayApplyFailed = 7,
-    kOwnedVirtualDisplayStabilityTimeout = 8,
+    kOwnedVirtualDisplayStabilityTimeoutStatus = 8,
     kOwnedVirtualDisplayRestoreFailed = 9,
 };
 
@@ -1021,7 +1021,7 @@ bool WaitForOwnedVirtualDisplayRaster(uint32_t width,
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
-    if (failureStatusOut != nullptr) *failureStatusOut = kOwnedVirtualDisplayStabilityTimeout;
+    if (failureStatusOut != nullptr) *failureStatusOut = kOwnedVirtualDisplayStabilityTimeoutStatus;
     return false;
 }
 
@@ -1175,7 +1175,7 @@ extern "C" int32_t MacOwnedVirtualDisplayApply(uint64_t ownerToken,
             CGDirectDisplayID displayID = 0;
             uint32_t actualWidth = 0;
             uint32_t actualHeight = 0;
-            int32_t failureStatus = kOwnedVirtualDisplayStabilityTimeout;
+            int32_t failureStatus = kOwnedVirtualDisplayStabilityTimeoutStatus;
             if (!WaitForOwnedVirtualDisplayRaster(width, height, &displayID,
                                                    &actualWidth, &actualHeight,
                                                    &failureStatus)) {
@@ -1201,7 +1201,7 @@ extern "C" int32_t MacOwnedVirtualDisplayApply(uint64_t ownerToken,
             CGDirectDisplayID restoreID = 0;
             uint32_t restoreWidth = 0;
             uint32_t restoreHeight = 0;
-            int32_t restoreFailure = kOwnedVirtualDisplayStabilityTimeout;
+            int32_t restoreFailure = kOwnedVirtualDisplayStabilityTimeoutStatus;
             restored = restored && WaitForOwnedVirtualDisplayRaster(oldWidth, oldHeight,
                 &restoreID, &restoreWidth, &restoreHeight, &restoreFailure);
             if (restored) {
@@ -1217,7 +1217,7 @@ extern "C" int32_t MacOwnedVirtualDisplayApply(uint64_t ownerToken,
         CGDirectDisplayID actualDisplayID = 0;
         uint32_t actualWidth = 0;
         uint32_t actualHeight = 0;
-        int32_t failureStatus = kOwnedVirtualDisplayStabilityTimeout;
+        int32_t failureStatus = kOwnedVirtualDisplayStabilityTimeoutStatus;
         if (!WaitForOwnedVirtualDisplayRaster(width, height, &actualDisplayID,
                                                &actualWidth, &actualHeight,
                                                &failureStatus)) {
@@ -1227,7 +1227,7 @@ extern "C" int32_t MacOwnedVirtualDisplayApply(uint64_t ownerToken,
                 CGDirectDisplayID restoreID = 0;
                 uint32_t restoreWidth = 0;
                 uint32_t restoreHeight = 0;
-                int32_t restoreFailure = kOwnedVirtualDisplayStabilityTimeout;
+                int32_t restoreFailure = kOwnedVirtualDisplayStabilityTimeoutStatus;
                 restored = restored && WaitForOwnedVirtualDisplayRaster(oldWidth, oldHeight,
                     &restoreID, &restoreWidth, &restoreHeight, &restoreFailure);
                 if (restored) {
