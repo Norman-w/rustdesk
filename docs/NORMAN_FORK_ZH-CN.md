@@ -80,8 +80,14 @@ NORMAN_CM_HELPER_OUTPUT_DIR="$NORMAN_MACOS_OUTPUT_DIR" \
 
 ## 签名与验收边界
 
-未提供 `NORMAN_APP_SIGNING_IDENTITY` 时，应用构建采用开发用 ad-hoc 签名。
-这不代表另一台 Mac 可正常双击安装，分发校验也会拒绝把 ad-hoc App 当作稳定签名版本。
+未提供 `NORMAN_APP_SIGNING_IDENTITY` 时，应用构建会先查找钥匙串中的
+`Norman Remote Desktop Local Code Signing` 并使用它；本机没有该身份时才退回开发用
+ad-hoc 签名。固定签名身份很重要：macOS TCC 会把授权绑定到代码身份，固定身份可避免
+每次重建后被当成“新应用”而再次显示未授权。若要明确生成临时 ad-hoc 包，可设置
+`NORMAN_APP_SIGNING_IDENTITY=-`。
+
+本地固定签名仍不是可跨 Mac 分发的正式签名；正式分发需 Developer ID Application、
+Developer ID Installer 及公证，分发校验也会拒绝 ad-hoc App。
 正式分发需 Developer ID Application、Developer ID Installer 及公证：
 
 ```sh
