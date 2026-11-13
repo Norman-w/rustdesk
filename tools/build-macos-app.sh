@@ -92,8 +92,24 @@ for binary in "$built_app/Contents/MacOS/NormanRemoteDesktop" \
   /usr/bin/install_name_tool -change "$dependency" "$local_dependency" "$binary"
 done
 
-# A local ad-hoc build is not a distributable, notarized release.
-identity="${NORMAN_APP_SIGNING_IDENTITY:--}"
+# Keep a stable local signing identity by default. macOS TCC grants are tied
+# to the executable's designated code identity; signing every local rebuild
+# ad-hoc creates a new code hash and can make an already-approved app appear
+# unauthorized after the next launch. An explicit identity (including '-'
+# for an intentional ad-hoc build) still wins.
+identity="${NORMAN_APP_SIGNING_IDENTITY:-}"
+if [ -z "$identity" ]; then
+  identity=$(
+    /usr/bin/security find-identity -v -p codesigning 2>/dev/null |
+      /usr/bin/awk -F '"' '$2 == "Norman Remote Desktop Local Code Signing" { print $2; exit }'
+  )
+fi
+if [ -z "$identity" ]; then
+  identity="-"
+  echo "warning: no stable Norman code-signing identity found; using an ad-hoc signature" >&2
+else
+  echo "Using macOS application signing identity: $identity"
+fi
 /usr/bin/codesign --force --deep --sign "$identity" "$built_app"
 /usr/bin/codesign --verify --deep --strict "$built_app"
 app_output="$output_directory/NormanRemoteDesktop.app"

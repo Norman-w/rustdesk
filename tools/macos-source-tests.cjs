@@ -47,6 +47,8 @@ test('build and packaging have no HarmonyOS checkout or installed app dependency
   assert.match(build, /flutter_rust_bridge_codegen/);
   assert.match(build, /cargo build --locked/);
   assert.match(build, /flutter,screencapturekit/);
+  assert.match(build, /Norman Remote Desktop Local Code Signing/);
+  assert.match(build, /NORMAN_APP_SIGNING_IDENTITY/);
   assert.doesNotMatch(build, /\/Applications\/|git\s+.*apply|patch\s+-p/);
   for (const file of filesIn('tools').filter((name) => name.endsWith('.sh'))) {
     assert.doesNotMatch(read(file), /CodexProjects\/NormanRemoteDesktop-HarmonyOS/);
