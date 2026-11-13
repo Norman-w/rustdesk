@@ -81,6 +81,23 @@ extern "C" {
     fn majorVersion() -> u32;
     fn MacGetMode(display: u32, width: *mut u32, height: *mut u32) -> BOOL;
     fn MacSetMode(display: u32, width: u32, height: u32, tryHiDPI: bool) -> BOOL;
+    fn MacOwnedVirtualDisplayGetCapabilities(
+        max_width: *mut u32,
+        max_height: *mut u32,
+        width_alignment: *mut u32,
+        height_alignment: *mut u32,
+        max_pixels: *mut u64,
+    ) -> i32;
+    fn MacOwnedVirtualDisplayApply(
+        owner_token: u64,
+        generation: u64,
+        width: u32,
+        height: u32,
+        display_id: *mut u32,
+        pixel_width: *mut u32,
+        pixel_height: *mut u32,
+    ) -> i32;
+    fn MacOwnedVirtualDisplayRelease(owner_token: u64, generation: u64) -> i32;
     fn CGWarpMouseCursorPosition(newCursorPosition: CGPoint) -> CGError;
     fn CGAssociateMouseAndMouseCursorPosition(connected: BooleanT) -> CGError;
     fn MacBeginRemoteMicRoute(requested_name: *const std::os::raw::c_char) -> bool;
@@ -1466,6 +1483,96 @@ pub fn change_resolution_directly(name: &str, width: usize, height: usize) -> Re
         }
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct OwnedVirtualDisplayCapabilities {
+    pub status: i32,
+    pub max_width: u32,
+    pub max_height: u32,
+    pub width_alignment: u32,
+    pub height_alignment: u32,
+    pub max_pixels: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct OwnedVirtualDisplayResult {
+    pub display_id: u32,
+    pub pixel_width: u32,
+    pub pixel_height: u32,
+}
+
+pub const OWNED_VIRTUAL_DISPLAY_OK: i32 = 0;
+pub const OWNED_VIRTUAL_DISPLAY_INVALID_ARGUMENT: i32 = 1;
+pub const OWNED_VIRTUAL_DISPLAY_RUNTIME_UNAVAILABLE: i32 = 2;
+pub const OWNED_VIRTUAL_DISPLAY_UNSAFE_TOPOLOGY: i32 = 3;
+pub const OWNED_VIRTUAL_DISPLAY_BUSY_OWNER: i32 = 4;
+pub const OWNED_VIRTUAL_DISPLAY_STALE_GENERATION: i32 = 5;
+pub const OWNED_VIRTUAL_DISPLAY_CREATE_FAILED: i32 = 6;
+pub const OWNED_VIRTUAL_DISPLAY_APPLY_FAILED: i32 = 7;
+pub const OWNED_VIRTUAL_DISPLAY_STABILITY_TIMEOUT: i32 = 8;
+pub const OWNED_VIRTUAL_DISPLAY_RESTORE_FAILED: i32 = 9;
+
+/// Query whether this process can create or reconfigure its session-owned virtual display.
+/// The native probe is side-effect free and returns status 0 only for a safe topology.
+#[allow(dead_code)]
+pub fn owned_virtual_display_capabilities() -> OwnedVirtualDisplayCapabilities {
+    let (mut max_width, mut max_height, mut width_alignment, mut height_alignment, mut max_pixels) =
+        (0, 0, 0, 0, 0);
+    let status = unsafe {
+        MacOwnedVirtualDisplayGetCapabilities(
+            &mut max_width,
+            &mut max_height,
+            &mut width_alignment,
+            &mut height_alignment,
+            &mut max_pixels,
+        )
+    };
+    OwnedVirtualDisplayCapabilities {
+        status,
+        max_width,
+        max_height,
+        width_alignment,
+        height_alignment,
+        max_pixels,
+    }
+}
+
+/// Apply an even-aligned target to the one CGVirtualDisplay owned by the Rust coordinator.
+/// Run this blocking native call away from the connection receive loop.
+#[allow(dead_code)]
+pub fn apply_owned_virtual_display(
+    owner_token: u64,
+    generation: u64,
+    width: u32,
+    height: u32,
+) -> Result<OwnedVirtualDisplayResult, i32> {
+    let (mut display_id, mut pixel_width, mut pixel_height) = (0, 0, 0);
+    let status = unsafe {
+        MacOwnedVirtualDisplayApply(
+            owner_token,
+            generation,
+            width,
+            height,
+            &mut display_id,
+            &mut pixel_width,
+            &mut pixel_height,
+        )
+    };
+    if status != 0 {
+        return Err(status);
+    }
+    Ok(OwnedVirtualDisplayResult {
+        display_id,
+        pixel_width,
+        pixel_height,
+    })
+}
+
+/// Release only the current owner generation; status 0 includes an already-released lease.
+#[allow(dead_code)]
+pub fn release_owned_virtual_display(owner_token: u64, generation: u64) -> i32 {
+    unsafe { MacOwnedVirtualDisplayRelease(owner_token, generation) }
 }
 
 pub fn check_super_user_permission() -> ResultType<bool> {

@@ -7,11 +7,58 @@
 #include <CoreGraphics/CoreGraphics.h>
 #include <CoreAudio/CoreAudio.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <dispatch/dispatch.h>
 #include <vector>
 #include <map>
 #include <set>
 #include <mutex>
 #include <string>
+#include <atomic>
+#include <chrono>
+#include <thread>
+#include <cstdint>
+#include <cmath>
+#include <cstdlib>
+#include <utility>
+
+// Private CoreGraphics runtime interfaces used for an explicitly requested,
+// session-owned headless display. Keep these declarations local to this file.
+@interface CGVirtualDisplay : NSObject
+@property(readonly, nonatomic) unsigned int displayID;
+- (instancetype)initWithDescriptor:(id)descriptor;
+- (BOOL)applySettings:(id)settings;
+@end
+
+@interface CGVirtualDisplayDescriptor : NSObject
+@property(nonatomic) unsigned int vendorID;
+@property(nonatomic) unsigned int productID;
+@property(nonatomic) unsigned int serialNum;
+@property(nonatomic) unsigned int serialNumber API_AVAILABLE(macos(11.0));
+@property(retain, nonatomic) NSString *name;
+@property(nonatomic) CGSize sizeInMillimeters;
+@property(nonatomic) unsigned int maxPixelsWide;
+@property(nonatomic) unsigned int maxPixelsHigh;
+@property(nonatomic) CGPoint redPrimary;
+@property(nonatomic) CGPoint greenPrimary;
+@property(nonatomic) CGPoint bluePrimary;
+@property(nonatomic) CGPoint whitePoint;
+@property(retain, nonatomic) id queue;
+@property(copy, nonatomic) id terminationHandler;
+- (instancetype)init;
+@end
+
+@interface CGVirtualDisplayMode : NSObject
+- (instancetype)initWithWidth:(unsigned int)width
+                       height:(unsigned int)height
+                  refreshRate:(double)refreshRate;
+@end
+
+@interface CGVirtualDisplaySettings : NSObject
+@property(retain, nonatomic) NSArray *modes;
+@property(nonatomic) unsigned int hiDPI;
+@property(nonatomic) unsigned int rotation API_AVAILABLE(macos(11.0));
+- (instancetype)init;
+@end
 
 namespace {
 std::mutex g_remote_mic_route_mutex;
@@ -700,6 +747,540 @@ extern "C" bool MacSetMode(CGDirectDisplayID display, uint32_t width, uint32_t h
     CGDisplayModeRelease(currentMode);
     CFRelease(allModes);
     return ret;
+}
+
+namespace {
+constexpr uint32_t kOwnedVirtualDisplayVendorID = 0x4e52;   // "NR"
+constexpr uint32_t kOwnedVirtualDisplayProductID = 0x30d1;  // RustDesk-owned display.
+constexpr uint32_t kOwnedVirtualDisplayMaxDimension = 4096;
+constexpr uint64_t kOwnedVirtualDisplayMaxPixels = 8388608;
+constexpr uint32_t kOwnedVirtualDisplayAlignment = 2;
+constexpr unsigned int kOwnedVirtualDisplayMinDimension = 320;
+constexpr auto kOwnedVirtualDisplayStabilityTimeout = std::chrono::seconds(8);
+constexpr auto kOwnedVirtualDisplayReleaseTimeout = std::chrono::seconds(5);
+
+enum OwnedVirtualDisplayStatus : int32_t {
+    kOwnedVirtualDisplayOk = 0,
+    kOwnedVirtualDisplayInvalidArgument = 1,
+    kOwnedVirtualDisplayRuntimeUnavailable = 2,
+    kOwnedVirtualDisplayUnsafeTopology = 3,
+    kOwnedVirtualDisplayBusyOwner = 4,
+    kOwnedVirtualDisplayStaleGeneration = 5,
+    kOwnedVirtualDisplayCreateFailed = 6,
+    kOwnedVirtualDisplayApplyFailed = 7,
+    kOwnedVirtualDisplayStabilityTimeout = 8,
+    kOwnedVirtualDisplayRestoreFailed = 9,
+};
+
+struct OwnedVirtualDisplayState {
+    CGVirtualDisplay *display = nil;
+    CGVirtualDisplayDescriptor *descriptor = nil;
+    CGVirtualDisplaySettings *settings = nil;
+    uint64_t ownerToken = 0;
+    uint64_t generation = 0;
+    uint32_t displayID = 0;
+    uint32_t serial = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    bool reconfigurationCallbackRegistered = false;
+};
+
+std::mutex g_ownedVirtualDisplayMutex;
+OwnedVirtualDisplayState g_ownedVirtualDisplay;
+std::atomic<uint64_t> g_ownedVirtualDisplayReconfigurationEvents{0};
+
+void OwnedVirtualDisplayReconfigurationCallback(CGDirectDisplayID display,
+                                                 CGDisplayChangeSummaryFlags flags,
+                                                 void *userInfo) {
+    (void)display;
+    (void)userInfo;
+    if (!(flags & kCGDisplayBeginConfigurationFlag)) {
+        g_ownedVirtualDisplayReconfigurationEvents.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+bool OwnedVirtualDisplayRuntimeAvailable() {
+    return NSClassFromString(@"CGVirtualDisplay") != Nil &&
+           NSClassFromString(@"CGVirtualDisplayDescriptor") != Nil &&
+           NSClassFromString(@"CGVirtualDisplayMode") != Nil &&
+           NSClassFromString(@"CGVirtualDisplaySettings") != Nil;
+}
+
+bool GetOnlineDisplayIDs(std::vector<CGDirectDisplayID> *ids) {
+    if (ids == nullptr) return false;
+    uint32_t count = 0;
+    if (CGGetOnlineDisplayList(0, nullptr, &count) != kCGErrorSuccess || count > 64) {
+        return false;
+    }
+    if (count == 0) {
+        ids->clear();
+        return true;
+    }
+    ids->resize(count);
+    if (CGGetOnlineDisplayList(count, ids->data(), &count) != kCGErrorSuccess || count > 64) {
+        ids->clear();
+        return false;
+    }
+    ids->resize(count);
+    return true;
+}
+
+bool IsHeadlessPlaceholder(CGDirectDisplayID displayID) {
+    return CGDisplayVendorNumber(displayID) == 0x756e6b6e &&
+           CGDisplayModelNumber(displayID) == 0x76697274 &&
+           CGDisplaySerialNumber(displayID) == 0 &&
+           !CGDisplayIsBuiltin(displayID) && CGDisplayIsActive(displayID) &&
+           CGDisplayIsOnline(displayID) && !CGDisplayIsInMirrorSet(displayID) &&
+           CGDisplayPixelsWide(displayID) > 0 && CGDisplayPixelsHigh(displayID) > 0;
+}
+
+bool IsOwnedVirtualDisplay(CGDirectDisplayID displayID) {
+    return g_ownedVirtualDisplay.display != nil &&
+           CGDisplayVendorNumber(displayID) == kOwnedVirtualDisplayVendorID &&
+           CGDisplayModelNumber(displayID) == kOwnedVirtualDisplayProductID &&
+           CGDisplaySerialNumber(displayID) == g_ownedVirtualDisplay.serial &&
+           !CGDisplayIsBuiltin(displayID) && CGDisplayIsActive(displayID) &&
+           CGDisplayIsOnline(displayID) && !CGDisplayIsInMirrorSet(displayID) &&
+           CGDisplayPixelsWide(displayID) > 0 && CGDisplayPixelsHigh(displayID) > 0;
+}
+
+CGDirectDisplayID FindOwnedVirtualDisplayID() {
+    std::vector<CGDirectDisplayID> ids;
+    if (!GetOnlineDisplayIDs(&ids)) return 0;
+    CGDirectDisplayID found = 0;
+    for (CGDirectDisplayID displayID : ids) {
+        if (!IsOwnedVirtualDisplay(displayID)) continue;
+        if (found != 0) return 0;
+        found = displayID;
+    }
+    return found;
+}
+
+bool OwnedVirtualDisplayTopologyIsSafe(bool requireOwnedDisplay) {
+    std::vector<CGDirectDisplayID> ids;
+    if (!GetOnlineDisplayIDs(&ids)) return false;
+    if (g_ownedVirtualDisplay.display == nil) {
+        return ids.size() == 1 && IsHeadlessPlaceholder(ids.front()) &&
+               CGMainDisplayID() == ids.front();
+    }
+
+    size_t ownedCount = 0;
+    size_t placeholderCount = 0;
+    for (CGDirectDisplayID displayID : ids) {
+        if (IsOwnedVirtualDisplay(displayID)) {
+            ++ownedCount;
+        } else if (IsHeadlessPlaceholder(displayID)) {
+            ++placeholderCount;
+        } else {
+            return false;
+        }
+    }
+    if (ownedCount > 1 || placeholderCount > 1) return false;
+    return !requireOwnedDisplay || ownedCount == 1;
+}
+
+CGVirtualDisplaySettings *CreateOwnedVirtualDisplaySettings(uint32_t width, uint32_t height) {
+    CGVirtualDisplaySettings *settings = nil;
+    CGVirtualDisplayMode *mode = nil;
+    NSArray *modes = nil;
+    @try {
+        settings = [[CGVirtualDisplaySettings alloc] init];
+        if (settings == nil) return nil;
+        mode = [[CGVirtualDisplayMode alloc]
+            initWithWidth:width height:height refreshRate:60.0];
+        if (mode == nil) {
+            [settings release];
+            return nil;
+        }
+        modes = [[NSArray alloc] initWithObjects:mode, nil];
+        settings.modes = modes;
+        settings.hiDPI = 0;
+        if (@available(macOS 11.0, *)) settings.rotation = 0;
+        [modes release];
+        modes = nil;
+        [mode release];
+        mode = nil;
+        return settings;
+    } @catch (NSException *exception) {
+        NSLog(@"Owned virtual display mode init exception: %@", exception.reason ?: @"unknown");
+        if (modes != nil) [modes release];
+        if (mode != nil) [mode release];
+        if (settings != nil) [settings release];
+        return nil;
+    }
+}
+
+CGVirtualDisplay *CreateOwnedVirtualDisplay(CGVirtualDisplayDescriptor **descriptorOut,
+                                            uint32_t width,
+                                            uint32_t height,
+                                            uint32_t *serialOut) {
+    if (descriptorOut == nullptr || serialOut == nullptr) return nil;
+    *descriptorOut = nil;
+    *serialOut = 0;
+
+    uint32_t serial = arc4random();
+    if (serial == 0) serial = 1;
+    NSString *displayName = [NSString stringWithFormat:@"NormanRemoteDesktop-%@", NSUUID.UUID.UUIDString];
+    CGVirtualDisplayDescriptor *descriptor = nil;
+    CGVirtualDisplay *display = nil;
+    @try {
+        descriptor = [[CGVirtualDisplayDescriptor alloc] init];
+        if (descriptor == nil) return nil;
+        descriptor.queue = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
+        descriptor.name = displayName;
+        descriptor.vendorID = kOwnedVirtualDisplayVendorID;
+        descriptor.productID = kOwnedVirtualDisplayProductID;
+        descriptor.serialNum = serial;
+        if (@available(macOS 11.0, *)) descriptor.serialNumber = serial;
+        descriptor.maxPixelsWide = kOwnedVirtualDisplayMaxDimension;
+        descriptor.maxPixelsHigh = kOwnedVirtualDisplayMaxDimension;
+        descriptor.sizeInMillimeters = CGSizeMake(25.4 * width / 96.0,
+                                                   25.4 * height / 96.0);
+        descriptor.whitePoint = CGPointMake(0.3125, 0.3291);
+        descriptor.bluePrimary = CGPointMake(0.1494, 0.0557);
+        descriptor.greenPrimary = CGPointMake(0.2559, 0.6983);
+        descriptor.redPrimary = CGPointMake(0.6797, 0.3203);
+        descriptor.terminationHandler = nil;
+        display = [[CGVirtualDisplay alloc] initWithDescriptor:descriptor];
+    } @catch (NSException *exception) {
+        NSLog(@"Owned virtual display create exception: %@", exception.reason ?: @"unknown");
+    }
+    if (display == nil) {
+        if (descriptor != nil) [descriptor release];
+        return nil;
+    }
+    *descriptorOut = descriptor;
+    *serialOut = serial;
+    return display;
+}
+
+bool IsValidOwnedVirtualDisplaySize(uint32_t width, uint32_t height) {
+    return width >= kOwnedVirtualDisplayMinDimension && height >= kOwnedVirtualDisplayMinDimension &&
+           width <= kOwnedVirtualDisplayMaxDimension && height <= kOwnedVirtualDisplayMaxDimension &&
+           width % kOwnedVirtualDisplayAlignment == 0 && height % kOwnedVirtualDisplayAlignment == 0 &&
+           static_cast<uint64_t>(width) * static_cast<uint64_t>(height) <= kOwnedVirtualDisplayMaxPixels;
+}
+
+void ClearOwnedVirtualDisplayState() {
+    if (g_ownedVirtualDisplay.reconfigurationCallbackRegistered) {
+        CGDisplayRemoveReconfigurationCallback(OwnedVirtualDisplayReconfigurationCallback, nullptr);
+    }
+    CGVirtualDisplay *display = g_ownedVirtualDisplay.display;
+    CGVirtualDisplayDescriptor *descriptor = g_ownedVirtualDisplay.descriptor;
+    CGVirtualDisplaySettings *settings = g_ownedVirtualDisplay.settings;
+    g_ownedVirtualDisplay = OwnedVirtualDisplayState{};
+    if (display != nil) [display release];
+    if (settings != nil) [settings release];
+    if (descriptor != nil) [descriptor release];
+}
+
+bool WaitForOwnedVirtualDisplayRaster(uint32_t width,
+                                      uint32_t height,
+                                      CGDirectDisplayID *displayIDOut,
+                                      uint32_t *pixelWidthOut,
+                                      uint32_t *pixelHeightOut,
+                                      int32_t *failureStatusOut) {
+    auto deadline = std::chrono::steady_clock::now() + kOwnedVirtualDisplayStabilityTimeout;
+    CGDirectDisplayID previousID = 0;
+    uint32_t previousWidth = 0;
+    uint32_t previousHeight = 0;
+    size_t stableSamples = 0;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (!OwnedVirtualDisplayTopologyIsSafe(false)) {
+            if (failureStatusOut != nullptr) *failureStatusOut = kOwnedVirtualDisplayUnsafeTopology;
+            return false;
+        }
+        CGDirectDisplayID displayID = FindOwnedVirtualDisplayID();
+        if (displayID != 0) {
+            uint32_t pixelWidth = static_cast<uint32_t>(CGDisplayPixelsWide(displayID));
+            uint32_t pixelHeight = static_cast<uint32_t>(CGDisplayPixelsHigh(displayID));
+            CGRect bounds = CGDisplayBounds(displayID);
+            bool targetMatches = pixelWidth == width && pixelHeight == height &&
+                std::fabs(bounds.size.width - static_cast<double>(width)) < 0.5 &&
+                std::fabs(bounds.size.height - static_cast<double>(height)) < 0.5;
+            if (targetMatches && displayID == previousID &&
+                pixelWidth == previousWidth && pixelHeight == previousHeight) {
+                ++stableSamples;
+            } else {
+                stableSamples = targetMatches ? 1 : 0;
+            }
+            previousID = displayID;
+            previousWidth = pixelWidth;
+            previousHeight = pixelHeight;
+            if (stableSamples >= 3) {
+                if (displayIDOut != nullptr) *displayIDOut = displayID;
+                if (pixelWidthOut != nullptr) *pixelWidthOut = pixelWidth;
+                if (pixelHeightOut != nullptr) *pixelHeightOut = pixelHeight;
+                return true;
+            }
+        } else {
+            previousID = 0;
+            previousWidth = 0;
+            previousHeight = 0;
+            stableSamples = 0;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    if (failureStatusOut != nullptr) *failureStatusOut = kOwnedVirtualDisplayStabilityTimeout;
+    return false;
+}
+
+bool WaitForOwnedVirtualDisplayRemoval(uint32_t serial) {
+    auto deadline = std::chrono::steady_clock::now() + kOwnedVirtualDisplayReleaseTimeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        std::vector<CGDirectDisplayID> ids;
+        if (GetOnlineDisplayIDs(&ids)) {
+            bool stillOnline = false;
+            for (CGDirectDisplayID displayID : ids) {
+                if (CGDisplayVendorNumber(displayID) == kOwnedVirtualDisplayVendorID &&
+                    CGDisplayModelNumber(displayID) == kOwnedVirtualDisplayProductID &&
+                    CGDisplaySerialNumber(displayID) == serial) {
+                    stillOnline = true;
+                    break;
+                }
+            }
+            if (!stillOnline) return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    return false;
+}
+
+int32_t ApplyOwnedVirtualDisplaySettings(uint32_t width,
+                                         uint32_t height,
+                                         CGVirtualDisplaySettings **settingsOut) {
+    if (settingsOut == nullptr) return kOwnedVirtualDisplayInvalidArgument;
+    *settingsOut = nil;
+    CGVirtualDisplaySettings *settings = CreateOwnedVirtualDisplaySettings(width, height);
+    if (settings == nil) return kOwnedVirtualDisplayApplyFailed;
+    @try {
+        if (![g_ownedVirtualDisplay.display applySettings:settings]) {
+            [settings release];
+            return kOwnedVirtualDisplayApplyFailed;
+        }
+        *settingsOut = settings;
+        return kOwnedVirtualDisplayOk;
+    } @catch (NSException *exception) {
+        NSLog(@"Owned virtual display settings exception: %@", exception.reason ?: @"unknown");
+        [settings release];
+        return kOwnedVirtualDisplayApplyFailed;
+    }
+}
+
+bool ReapplyOwnedVirtualDisplaySettings(CGVirtualDisplaySettings *settings) {
+    if (settings == nil || g_ownedVirtualDisplay.display == nil) return false;
+    @try {
+        return [g_ownedVirtualDisplay.display applySettings:settings];
+    } @catch (NSException *exception) {
+        NSLog(@"Owned virtual display rollback exception: %@", exception.reason ?: @"unknown");
+        return false;
+    }
+}
+}  // namespace
+
+// Capability probing has no display-creation or display-reconfiguration side effect.
+// Status: 0 ready, 1 invalid argument, 2 runtime unavailable, 3 unsafe topology.
+extern "C" int32_t MacOwnedVirtualDisplayGetCapabilities(uint32_t *maxWidth,
+                                                         uint32_t *maxHeight,
+                                                         uint32_t *widthAlignment,
+                                                         uint32_t *heightAlignment,
+                                                         uint64_t *maxPixels) {
+    if (maxWidth == nullptr || maxHeight == nullptr || widthAlignment == nullptr ||
+        heightAlignment == nullptr || maxPixels == nullptr) {
+        return kOwnedVirtualDisplayInvalidArgument;
+    }
+    *maxWidth = 0;
+    *maxHeight = 0;
+    *widthAlignment = 0;
+    *heightAlignment = 0;
+    *maxPixels = 0;
+    @autoreleasepool {
+        std::lock_guard<std::mutex> lock(g_ownedVirtualDisplayMutex);
+        if (!OwnedVirtualDisplayRuntimeAvailable()) return kOwnedVirtualDisplayRuntimeUnavailable;
+        *maxWidth = kOwnedVirtualDisplayMaxDimension;
+        *maxHeight = kOwnedVirtualDisplayMaxDimension;
+        *widthAlignment = kOwnedVirtualDisplayAlignment;
+        *heightAlignment = kOwnedVirtualDisplayAlignment;
+        *maxPixels = kOwnedVirtualDisplayMaxPixels;
+        if (!OwnedVirtualDisplayTopologyIsSafe(g_ownedVirtualDisplay.display != nil)) {
+            return kOwnedVirtualDisplayUnsafeTopology;
+        }
+        return kOwnedVirtualDisplayOk;
+    }
+}
+
+// Apply is synchronous but bounded to eight seconds for CG raster stabilization.
+// Callers must run it on a blocking worker, never on the connection receive loop.
+extern "C" int32_t MacOwnedVirtualDisplayApply(uint64_t ownerToken,
+                                               uint64_t generation,
+                                               uint32_t width,
+                                               uint32_t height,
+                                               uint32_t *displayIDOut,
+                                               uint32_t *pixelWidthOut,
+                                               uint32_t *pixelHeightOut) {
+    if (displayIDOut == nullptr || pixelWidthOut == nullptr || pixelHeightOut == nullptr) {
+        return kOwnedVirtualDisplayInvalidArgument;
+    }
+    *displayIDOut = 0;
+    *pixelWidthOut = 0;
+    *pixelHeightOut = 0;
+    if (ownerToken == 0 || generation == 0 || !IsValidOwnedVirtualDisplaySize(width, height)) {
+        return kOwnedVirtualDisplayInvalidArgument;
+    }
+
+    @autoreleasepool {
+        std::lock_guard<std::mutex> lock(g_ownedVirtualDisplayMutex);
+        if (!OwnedVirtualDisplayRuntimeAvailable()) return kOwnedVirtualDisplayRuntimeUnavailable;
+        bool hadOwnedDisplay = g_ownedVirtualDisplay.display != nil;
+        if (hadOwnedDisplay && ownerToken != g_ownedVirtualDisplay.ownerToken) {
+            return kOwnedVirtualDisplayBusyOwner;
+        }
+        if (hadOwnedDisplay && generation < g_ownedVirtualDisplay.generation) {
+            return kOwnedVirtualDisplayStaleGeneration;
+        }
+        if (!OwnedVirtualDisplayTopologyIsSafe(hadOwnedDisplay)) {
+            return kOwnedVirtualDisplayUnsafeTopology;
+        }
+        if (hadOwnedDisplay && generation == g_ownedVirtualDisplay.generation &&
+            (width != g_ownedVirtualDisplay.width || height != g_ownedVirtualDisplay.height)) {
+            return kOwnedVirtualDisplayStaleGeneration;
+        }
+
+        uint32_t oldWidth = hadOwnedDisplay ? g_ownedVirtualDisplay.width : 0;
+        uint32_t oldHeight = hadOwnedDisplay ? g_ownedVirtualDisplay.height : 0;
+        uint64_t eventSerialAtStart = g_ownedVirtualDisplayReconfigurationEvents.load(std::memory_order_relaxed);
+        if (!hadOwnedDisplay) {
+            if (CGDisplayRegisterReconfigurationCallback(OwnedVirtualDisplayReconfigurationCallback,
+                                                         nullptr) != kCGErrorSuccess) {
+                return kOwnedVirtualDisplayApplyFailed;
+            }
+            g_ownedVirtualDisplay.reconfigurationCallbackRegistered = true;
+            CGVirtualDisplayDescriptor *descriptor = nil;
+            uint32_t serial = 0;
+            CGVirtualDisplay *display = CreateOwnedVirtualDisplay(&descriptor, width, height, &serial);
+            if (display == nil || descriptor == nil || serial == 0) {
+                if (display != nil) [display release];
+                if (descriptor != nil) [descriptor release];
+                ClearOwnedVirtualDisplayState();
+                return kOwnedVirtualDisplayCreateFailed;
+            }
+            g_ownedVirtualDisplay.display = display;
+            g_ownedVirtualDisplay.descriptor = descriptor;
+            g_ownedVirtualDisplay.ownerToken = ownerToken;
+            g_ownedVirtualDisplay.displayID = display.displayID;
+            g_ownedVirtualDisplay.serial = serial;
+        }
+
+        if (hadOwnedDisplay && generation == g_ownedVirtualDisplay.generation) {
+            CGDirectDisplayID displayID = 0;
+            uint32_t actualWidth = 0;
+            uint32_t actualHeight = 0;
+            int32_t failureStatus = kOwnedVirtualDisplayStabilityTimeout;
+            if (!WaitForOwnedVirtualDisplayRaster(width, height, &displayID,
+                                                   &actualWidth, &actualHeight,
+                                                   &failureStatus)) {
+                return failureStatus;
+            }
+            *displayIDOut = displayID;
+            *pixelWidthOut = actualWidth;
+            *pixelHeightOut = actualHeight;
+            return kOwnedVirtualDisplayOk;
+        }
+
+        CGVirtualDisplaySettings *newSettings = nil;
+        int32_t applyStatus = ApplyOwnedVirtualDisplaySettings(width, height, &newSettings);
+        if (applyStatus != kOwnedVirtualDisplayOk) {
+            if (!hadOwnedDisplay) {
+                uint32_t serial = g_ownedVirtualDisplay.serial;
+                ClearOwnedVirtualDisplayState();
+                return WaitForOwnedVirtualDisplayRemoval(serial)
+                    ? kOwnedVirtualDisplayApplyFailed : kOwnedVirtualDisplayRestoreFailed;
+            }
+            bool restored = oldWidth != 0 && oldHeight != 0 &&
+                ReapplyOwnedVirtualDisplaySettings(g_ownedVirtualDisplay.settings);
+            CGDirectDisplayID restoreID = 0;
+            uint32_t restoreWidth = 0;
+            uint32_t restoreHeight = 0;
+            int32_t restoreFailure = kOwnedVirtualDisplayStabilityTimeout;
+            restored = restored && WaitForOwnedVirtualDisplayRaster(oldWidth, oldHeight,
+                &restoreID, &restoreWidth, &restoreHeight, &restoreFailure);
+            if (restored) {
+                g_ownedVirtualDisplay.displayID = restoreID;
+                return kOwnedVirtualDisplayApplyFailed;
+            }
+            uint32_t serial = g_ownedVirtualDisplay.serial;
+            ClearOwnedVirtualDisplayState();
+            WaitForOwnedVirtualDisplayRemoval(serial);
+            return kOwnedVirtualDisplayRestoreFailed;
+        }
+
+        CGDirectDisplayID actualDisplayID = 0;
+        uint32_t actualWidth = 0;
+        uint32_t actualHeight = 0;
+        int32_t failureStatus = kOwnedVirtualDisplayStabilityTimeout;
+        if (!WaitForOwnedVirtualDisplayRaster(width, height, &actualDisplayID,
+                                               &actualWidth, &actualHeight,
+                                               &failureStatus)) {
+            if (hadOwnedDisplay) {
+                bool restored = oldWidth != 0 && oldHeight != 0 &&
+                    ReapplyOwnedVirtualDisplaySettings(g_ownedVirtualDisplay.settings);
+                CGDirectDisplayID restoreID = 0;
+                uint32_t restoreWidth = 0;
+                uint32_t restoreHeight = 0;
+                int32_t restoreFailure = kOwnedVirtualDisplayStabilityTimeout;
+                restored = restored && WaitForOwnedVirtualDisplayRaster(oldWidth, oldHeight,
+                    &restoreID, &restoreWidth, &restoreHeight, &restoreFailure);
+                if (restored) {
+                    if (newSettings != nil) [newSettings release];
+                    g_ownedVirtualDisplay.displayID = restoreID;
+                    return failureStatus;
+                }
+            }
+            if (newSettings != nil) [newSettings release];
+            uint32_t serial = g_ownedVirtualDisplay.serial;
+            ClearOwnedVirtualDisplayState();
+            bool removed = WaitForOwnedVirtualDisplayRemoval(serial);
+            if (!removed) return kOwnedVirtualDisplayRestoreFailed;
+            return failureStatus;
+        }
+
+        CGVirtualDisplaySettings *oldSettings = g_ownedVirtualDisplay.settings;
+        g_ownedVirtualDisplay.settings = newSettings;
+        newSettings = nil;
+        if (oldSettings != nil) [oldSettings release];
+        g_ownedVirtualDisplay.ownerToken = ownerToken;
+        g_ownedVirtualDisplay.generation = generation;
+        g_ownedVirtualDisplay.displayID = actualDisplayID;
+        g_ownedVirtualDisplay.width = width;
+        g_ownedVirtualDisplay.height = height;
+        *displayIDOut = actualDisplayID;
+        *pixelWidthOut = actualWidth;
+        *pixelHeightOut = actualHeight;
+        uint64_t eventsSeen = g_ownedVirtualDisplayReconfigurationEvents.load(std::memory_order_relaxed) -
+                              eventSerialAtStart;
+        NSLog(@"Owned virtual display applied: id=%u size=%ux%u generation=%llu reconfigurationEvents=%llu",
+              actualDisplayID, actualWidth, actualHeight,
+              static_cast<unsigned long long>(generation),
+              static_cast<unsigned long long>(eventsSeen));
+        return kOwnedVirtualDisplayOk;
+    }
+}
+
+// Release is idempotent after cleanup and never changes another display's mode or topology.
+extern "C" int32_t MacOwnedVirtualDisplayRelease(uint64_t ownerToken, uint64_t generation) {
+    if (ownerToken == 0 || generation == 0) return kOwnedVirtualDisplayInvalidArgument;
+    @autoreleasepool {
+        std::lock_guard<std::mutex> lock(g_ownedVirtualDisplayMutex);
+        if (g_ownedVirtualDisplay.display == nil) return kOwnedVirtualDisplayOk;
+        if (ownerToken != g_ownedVirtualDisplay.ownerToken) return kOwnedVirtualDisplayBusyOwner;
+        if (generation != g_ownedVirtualDisplay.generation) return kOwnedVirtualDisplayStaleGeneration;
+        uint32_t serial = g_ownedVirtualDisplay.serial;
+        uint32_t displayID = g_ownedVirtualDisplay.displayID;
+        ClearOwnedVirtualDisplayState();
+        bool removed = WaitForOwnedVirtualDisplayRemoval(serial);
+        NSLog(@"Owned virtual display released: id=%u removed=%d", displayID, removed ? 1 : 0);
+        return removed ? kOwnedVirtualDisplayOk : kOwnedVirtualDisplayRestoreFailed;
+    }
 }
 
 static CFMachPortRef g_eventTap = NULL;
