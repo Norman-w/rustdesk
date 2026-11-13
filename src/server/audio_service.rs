@@ -16,9 +16,9 @@ use super::*;
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 use hbb_common::anyhow::anyhow;
 use magnum_opus::{Application::*, Channels::*, Encoder};
-use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(target_os = "macos")]
 use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub const NAME: &'static str = "audio";
 pub const AUDIO_DATA_SIZE_U8: usize = 960 * 4; // 10ms in 48000 stereo
@@ -43,8 +43,8 @@ pub fn remote_audio_route_is_virtual() -> bool {
 
 #[cfg(target_os = "macos")]
 pub fn refresh_remote_audio_route() {
-    let should_route = REMOTE_AUDIO_SUBSCRIBERS.load(Ordering::SeqCst) > 0
-        && remote_audio_route_is_virtual();
+    let should_route =
+        REMOTE_AUDIO_SUBSCRIBERS.load(Ordering::SeqCst) > 0 && remote_audio_route_is_virtual();
     let route_active = REMOTE_AUDIO_ROUTE_ACTIVE.load(Ordering::SeqCst);
     if should_route && !route_active {
         if crate::platform::begin_remote_audio_route(NORMAN_REMOTE_AUDIO_OUTPUT_DEVICE) {
@@ -59,6 +59,12 @@ pub fn refresh_remote_audio_route() {
                 NORMAN_REMOTE_AUDIO_OUTPUT_DEVICE
             );
         }
+    } else if should_route && route_active {
+        // CoreAudio can change the default output behind our back when another
+        // app, a display, or a system audio event selects a device. Keep the
+        // active remote session bound to the virtual output without touching
+        // the saved device that will be restored when the session ends.
+        crate::platform::ensure_remote_audio_route(NORMAN_REMOTE_AUDIO_OUTPUT_DEVICE);
     } else if !should_route && route_active {
         crate::platform::end_remote_audio_route();
         REMOTE_AUDIO_ROUTE_ACTIVE.store(false, Ordering::SeqCst);
@@ -483,8 +489,15 @@ mod cpal_impl {
         T: cpal::SizedSample + dasp::sample::ToSample<f32>,
     {
         let err_fn = move |err| {
-            // too many UnknownErrno, will improve later
-            log::trace!("an error occurred on stream: {}", err);
+            // CoreAudio can invalidate the loopback stream when the default
+            // output changes. Logging alone leaves the phone with the first
+            // buffered syllables and no later audio, so let the service
+            // recreate the stream on its next tick.
+            log::warn!(
+                "an error occurred on remote audio stream; restarting: {}",
+                err
+            );
+            super::restart();
         };
         let sample_rate_0 = config.sample_rate().0;
         log::debug!("Audio sample rate : {}", sample_rate);

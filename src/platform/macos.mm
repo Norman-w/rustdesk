@@ -438,6 +438,34 @@ extern "C" bool MacBeginRemoteAudioRoute(const char *requested_name) {
     return true;
 }
 
+extern "C" bool MacEnsureRemoteAudioRoute(const char *requested_name) {
+    std::lock_guard<std::mutex> lock(g_remote_audio_route_mutex);
+    if (g_remote_audio_route_users == 0) {
+        return false;
+    }
+
+    AudioDeviceID target = find_remote_audio_output(requested_name);
+    if (target == kAudioObjectUnknown) {
+        return false;
+    }
+
+    AudioDeviceID current_output = kAudioObjectUnknown;
+    AudioDeviceID current_system_output = kAudioObjectUnknown;
+    if (!get_default_remote_audio_output(&current_output) ||
+        !get_default_remote_system_output(&current_system_output)) {
+        return false;
+    }
+
+    bool ok = true;
+    if (target != current_output && !set_default_remote_audio_output(target)) {
+        ok = false;
+    }
+    if (target != current_system_output && !set_default_remote_system_output(target)) {
+        ok = false;
+    }
+    return ok;
+}
+
 extern "C" void MacEndRemoteAudioRoute() {
     std::lock_guard<std::mutex> lock(g_remote_audio_route_mutex);
     if (g_remote_audio_route_users == 0) {
