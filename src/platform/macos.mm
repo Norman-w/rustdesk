@@ -5,13 +5,9 @@
 #include <Security/AuthorizationTags.h>
 
 #include <CoreGraphics/CoreGraphics.h>
-#include <CoreGraphics/CGSession.h>
 #include <CoreAudio/CoreAudio.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <dispatch/dispatch.h>
-#include <spawn.h>
-#include <sys/wait.h>
-#include <unistd.h>
 #include <vector>
 #include <map>
 #include <set>
@@ -22,10 +18,7 @@
 #include <thread>
 #include <cstdint>
 #include <cmath>
-#include <cstdlib>
 #include <utility>
-
-extern char **environ;
 
 // Private CoreGraphics runtime interfaces used for an explicitly requested,
 // session-owned headless display. Keep these declarations local to this file.
@@ -819,163 +812,6 @@ struct OwnedVirtualDisplayState {
     bool reconfigurationCallbackRegistered = false;
 };
 
-// Creating/reconfiguring CGVirtualDisplay can make WindowServer activate a
-// different Space (often the RustDesk utility window) while it re-enumerates
-// the headless display. Keep the pre-change frontmost application so a
-// session-owned display operation can return to the user's existing full
-// screen Space without trying to infer a window or an app-specific layout.
-struct FrontmostApplicationSnapshot {
-    uid_t uid = 0;
-    pid_t pid = 0;
-};
-
-bool ConsoleUserUID(uid_t *uidOut) {
-    if (uidOut == nullptr) return false;
-    *uidOut = 0;
-    CFDictionaryRef session = CGSessionCopyCurrentDictionary();
-    if (session == nullptr) return false;
-    CFTypeRef onConsole = CFDictionaryGetValue(session, kCGSessionOnConsoleKey);
-    bool onConsoleValue = onConsole == nullptr ||
-        (CFGetTypeID(onConsole) == CFBooleanGetTypeID() &&
-         CFBooleanGetValue(static_cast<CFBooleanRef>(onConsole)));
-    CFTypeRef userID = CFDictionaryGetValue(session, kCGSessionUserIDKey);
-    int32_t value = 0;
-    bool valid = onConsoleValue && userID != nullptr &&
-        CFGetTypeID(userID) == CFNumberGetTypeID() &&
-        CFNumberGetValue(static_cast<CFNumberRef>(userID), kCFNumberSInt32Type, &value) &&
-        value > 0;
-    if (valid) *uidOut = static_cast<uid_t>(value);
-    CFRelease(session);
-    return valid;
-}
-
-bool RunAsConsoleUserAppleScript(uid_t uid, const std::string &script, std::string *output) {
-    if (uid == 0 || script.empty()) return false;
-    int pipeFDs[2] = {-1, -1};
-    if (pipe(pipeFDs) != 0) return false;
-
-    posix_spawn_file_actions_t actions;
-    posix_spawn_file_actions_init(&actions);
-    posix_spawn_file_actions_adddup2(&actions, pipeFDs[1], STDOUT_FILENO);
-    posix_spawn_file_actions_adddup2(&actions, pipeFDs[1], STDERR_FILENO);
-    posix_spawn_file_actions_addclose(&actions, pipeFDs[0]);
-    posix_spawn_file_actions_addclose(&actions, pipeFDs[1]);
-
-    std::string uidString = std::to_string(uid);
-    char *argv[] = {
-        const_cast<char*>("/bin/launchctl"),
-        const_cast<char*>("asuser"),
-        const_cast<char*>(uidString.c_str()),
-        const_cast<char*>("/usr/bin/osascript"),
-        const_cast<char*>("-e"),
-        const_cast<char*>(script.c_str()),
-        nullptr,
-    };
-    pid_t child = 0;
-    int spawnStatus = posix_spawn(&child, "/bin/launchctl", &actions, nullptr, argv, environ);
-    posix_spawn_file_actions_destroy(&actions);
-    close(pipeFDs[1]);
-    if (spawnStatus != 0) {
-        close(pipeFDs[0]);
-        return false;
-    }
-
-    std::string captured;
-    char buffer[256];
-    ssize_t readCount = 0;
-    while ((readCount = read(pipeFDs[0], buffer, sizeof(buffer))) > 0) {
-        captured.append(buffer, static_cast<size_t>(readCount));
-    }
-    close(pipeFDs[0]);
-    int childStatus = 0;
-    if (waitpid(child, &childStatus, 0) != child ||
-        !WIFEXITED(childStatus) || WEXITSTATUS(childStatus) != 0) {
-        return false;
-    }
-    if (output != nullptr) *output = captured;
-    return true;
-}
-
-FrontmostApplicationSnapshot CaptureFrontmostApplication() {
-    __block pid_t pid = 0;
-    void (^capture)(void) = ^{
-        @autoreleasepool {
-            NSRunningApplication *application =
-                [[NSWorkspace sharedWorkspace] frontmostApplication];
-            if (application != nil) {
-                pid = application.processIdentifier;
-            }
-        }
-    };
-    uid_t uid = 0;
-    if (ConsoleUserUID(&uid)) {
-        std::string output;
-        if (RunAsConsoleUserAppleScript(
-                uid,
-                "tell application \"System Events\" to get unix id of first process whose frontmost is true",
-                &output)) {
-            char *end = nullptr;
-            long parsed = std::strtol(output.c_str(), &end, 10);
-            if (end != output.c_str() && parsed > 0 && parsed <= INT32_MAX) {
-                NSLog(@"Owned virtual display: captured console frontmost pid=%ld uid=%u",
-                      parsed, static_cast<unsigned>(uid));
-                return FrontmostApplicationSnapshot{uid, static_cast<pid_t>(parsed)};
-            }
-        }
-    }
-    if ([NSThread isMainThread]) {
-        capture();
-    } else {
-        dispatch_sync(dispatch_get_main_queue(), capture);
-    }
-    return FrontmostApplicationSnapshot{uid, pid};
-}
-
-void RestoreFrontmostApplication(FrontmostApplicationSnapshot snapshot,
-                                 const char *reason) {
-    if (snapshot.pid <= 0) return;
-    // Give WindowServer one turn to finish moving the display/Space before
-    // activating the saved application. Activation is deliberately delayed
-    // and performed on the AppKit main queue; doing it from the display worker
-    // can race AppKit's own Space transition.
-    dispatch_after(
-        dispatch_time(DISPATCH_TIME_NOW, 180 * NSEC_PER_MSEC),
-        dispatch_get_main_queue(),
-        ^{
-            @autoreleasepool {
-                if (snapshot.uid > 0) {
-                    std::string script =
-                        "tell application \"System Events\" to set frontmost of (first process whose unix id is " +
-                        std::to_string(snapshot.pid) + ") to true";
-                    std::string output;
-                    if (RunAsConsoleUserAppleScript(snapshot.uid, script, &output)) {
-                        NSLog(@"Owned virtual display: restored console frontmost application pid=%d uid=%u (%s)",
-                              snapshot.pid, static_cast<unsigned>(snapshot.uid),
-                              reason == nullptr ? "unknown" : reason);
-                        return;
-                    }
-                    NSLog(@"Owned virtual display: console frontmost restore failed pid=%d uid=%u (%s)",
-                          snapshot.pid, static_cast<unsigned>(snapshot.uid),
-                          reason == nullptr ? "unknown" : reason);
-                }
-                NSRunningApplication *application =
-                    [NSRunningApplication runningApplicationWithProcessIdentifier:snapshot.pid];
-                if (application == nil || application.terminated) {
-                    NSLog(@"Owned virtual display: saved frontmost application pid=%d is unavailable (%s)",
-                          snapshot.pid, reason == nullptr ? "unknown" : reason);
-                    return;
-                }
-                if (@available(macOS 14.0, *)) {
-                    [application activateWithOptions:0];
-                } else {
-                    [application activateWithOptions:NSApplicationActivateIgnoringOtherApps];
-                }
-                NSLog(@"Owned virtual display: restored frontmost application pid=%d (%s)",
-                      snapshot.pid, reason == nullptr ? "unknown" : reason);
-            }
-        });
-}
-
 std::mutex g_ownedVirtualDisplayMutex;
 OwnedVirtualDisplayState g_ownedVirtualDisplay;
 std::atomic<uint64_t> g_ownedVirtualDisplayReconfigurationEvents{0};
@@ -1340,7 +1176,6 @@ extern "C" int32_t MacOwnedVirtualDisplayApply(uint64_t ownerToken,
         uint32_t oldWidth = hadOwnedDisplay ? g_ownedVirtualDisplay.width : 0;
         uint32_t oldHeight = hadOwnedDisplay ? g_ownedVirtualDisplay.height : 0;
         uint64_t eventSerialAtStart = g_ownedVirtualDisplayReconfigurationEvents.load(std::memory_order_relaxed);
-        FrontmostApplicationSnapshot frontmost = CaptureFrontmostApplication();
         if (!hadOwnedDisplay) {
             if (CGDisplayRegisterReconfigurationCallback(OwnedVirtualDisplayReconfigurationCallback,
                                                          nullptr) != kCGErrorSuccess) {
@@ -1354,7 +1189,6 @@ extern "C" int32_t MacOwnedVirtualDisplayApply(uint64_t ownerToken,
                 if (display != nil) [display release];
                 if (descriptor != nil) [descriptor release];
                 ClearOwnedVirtualDisplayState();
-                RestoreFrontmostApplication(frontmost, "create_failed");
                 return kOwnedVirtualDisplayCreateFailed;
             }
             g_ownedVirtualDisplay.display = display;
@@ -1387,7 +1221,6 @@ extern "C" int32_t MacOwnedVirtualDisplayApply(uint64_t ownerToken,
                 uint32_t serial = g_ownedVirtualDisplay.serial;
                 ClearOwnedVirtualDisplayState();
                 bool removed = WaitForOwnedVirtualDisplayRemoval(serial);
-                RestoreFrontmostApplication(frontmost, "apply_failed");
                 return removed ? kOwnedVirtualDisplayApplyFailed : kOwnedVirtualDisplayRestoreFailed;
             }
             bool restored = oldWidth != 0 && oldHeight != 0 &&
@@ -1400,13 +1233,11 @@ extern "C" int32_t MacOwnedVirtualDisplayApply(uint64_t ownerToken,
                 &restoreID, &restoreWidth, &restoreHeight, &restoreFailure);
             if (restored) {
                 g_ownedVirtualDisplay.displayID = restoreID;
-                RestoreFrontmostApplication(frontmost, "apply_rolled_back");
                 return kOwnedVirtualDisplayApplyFailed;
             }
             uint32_t serial = g_ownedVirtualDisplay.serial;
             ClearOwnedVirtualDisplayState();
             WaitForOwnedVirtualDisplayRemoval(serial);
-            RestoreFrontmostApplication(frontmost, "apply_restore_failed");
             return kOwnedVirtualDisplayRestoreFailed;
         }
 
@@ -1429,7 +1260,6 @@ extern "C" int32_t MacOwnedVirtualDisplayApply(uint64_t ownerToken,
                 if (restored) {
                     if (newSettings != nil) [newSettings release];
                     g_ownedVirtualDisplay.displayID = restoreID;
-                    RestoreFrontmostApplication(frontmost, "raster_timeout_rolled_back");
                     return failureStatus;
                 }
             }
@@ -1437,7 +1267,6 @@ extern "C" int32_t MacOwnedVirtualDisplayApply(uint64_t ownerToken,
             uint32_t serial = g_ownedVirtualDisplay.serial;
             ClearOwnedVirtualDisplayState();
             bool removed = WaitForOwnedVirtualDisplayRemoval(serial);
-            RestoreFrontmostApplication(frontmost, removed ? "raster_timeout" : "raster_timeout_cleanup_failed");
             if (!removed) return kOwnedVirtualDisplayRestoreFailed;
             return failureStatus;
         }
@@ -1460,7 +1289,12 @@ extern "C" int32_t MacOwnedVirtualDisplayApply(uint64_t ownerToken,
               actualDisplayID, actualWidth, actualHeight,
               static_cast<unsigned long long>(generation),
               static_cast<unsigned long long>(eventsSeen));
-        RestoreFrontmostApplication(frontmost, hadOwnedDisplay ? "resize" : "create");
+        // Do not activate or restore an application here. On macOS an app's
+        // frontmost state is global to the login session, not scoped to the
+        // desktop currently visible to the user. Re-activating a captured
+        // process can therefore pull the user into a different full-screen
+        // Space (for example, the Windows App Space) after a 2x resize.
+        // Leaving activation untouched preserves the Space the user was in.
         return kOwnedVirtualDisplayOk;
     }
 }
@@ -1475,11 +1309,9 @@ extern "C" int32_t MacOwnedVirtualDisplayRelease(uint64_t ownerToken, uint64_t g
         if (generation != g_ownedVirtualDisplay.generation) return kOwnedVirtualDisplayStaleGeneration;
         uint32_t serial = g_ownedVirtualDisplay.serial;
         uint32_t displayID = g_ownedVirtualDisplay.displayID;
-        FrontmostApplicationSnapshot frontmost = CaptureFrontmostApplication();
         ClearOwnedVirtualDisplayState();
         bool removed = WaitForOwnedVirtualDisplayRemoval(serial);
         NSLog(@"Owned virtual display released: id=%u removed=%d", displayID, removed ? 1 : 0);
-        RestoreFrontmostApplication(frontmost, removed ? "release" : "release_timeout");
         return removed ? kOwnedVirtualDisplayOk : kOwnedVirtualDisplayRestoreFailed;
     }
 }
