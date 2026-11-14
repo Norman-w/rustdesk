@@ -931,7 +931,7 @@ FrontmostApplicationSnapshot CaptureFrontmostApplication() {
     return FrontmostApplicationSnapshot{uid, pid};
 }
 
-void RestoreFrontmostApplication(const FrontmostApplicationSnapshot &snapshot,
+void RestoreFrontmostApplication(FrontmostApplicationSnapshot snapshot,
                                  const char *reason) {
     if (snapshot.pid <= 0) return;
     // Give WindowServer one turn to finish moving the display/Space before
