@@ -784,6 +784,7 @@ constexpr uint32_t kOwnedVirtualDisplayMaxDimension = 4096;
 constexpr uint64_t kOwnedVirtualDisplayMaxPixels = 8388608;
 constexpr uint32_t kOwnedVirtualDisplayAlignment = 2;
 constexpr unsigned int kOwnedVirtualDisplayMinDimension = 320;
+constexpr unsigned int kOwnedVirtualDisplayFullscreenSpaceType = 4;
 constexpr auto kOwnedVirtualDisplayStabilityTimeout = std::chrono::seconds(8);
 constexpr auto kOwnedVirtualDisplayReleaseTimeout = std::chrono::seconds(5);
 
@@ -862,10 +863,14 @@ std::string StringFromNSString(NSString *value) {
     return utf8 == nullptr ? std::string() : std::string(utf8);
 }
 
-struct OwnedVirtualDisplaySpaceSnapshot {
+struct OwnedVirtualDisplaySpaceEntry {
     std::string displayIdentifier;
     std::string spaceUUID;
     uint64_t managedSpaceID = 0;
+};
+
+struct OwnedVirtualDisplaySpaceSnapshot {
+    std::vector<OwnedVirtualDisplaySpaceEntry> displays;
     bool valid = false;
 };
 
@@ -884,22 +889,103 @@ OwnedVirtualDisplaySpaceSnapshot CaptureCurrentOwnedDisplaySpace() {
         NSString *displayIdentifier = [display objectForKey:@"Display Identifier"];
         NSDictionary *currentSpace = [display objectForKey:@"Current Space"];
         NSNumber *managedSpaceID = [currentSpace objectForKey:@"ManagedSpaceID"];
-        if (displayIdentifier == nil || currentSpace == nil || managedSpaceID == nil) continue;
+        NSNumber *spaceType = [currentSpace objectForKey:@"type"];
+        // A normal desktop Space must not be explicitly selected. Calling the
+        // private setter for an ordinary Space can itself move the user to a
+        // different display while WindowServer is rebuilding the topology.
+        if (displayIdentifier == nil || currentSpace == nil || managedSpaceID == nil ||
+            spaceType == nil || [spaceType unsignedIntValue] != kOwnedVirtualDisplayFullscreenSpaceType) {
+            continue;
+        }
 
-        snapshot.displayIdentifier = StringFromNSString(displayIdentifier);
-        snapshot.spaceUUID = StringFromNSString([currentSpace objectForKey:@"uuid"]);
-        snapshot.managedSpaceID = [managedSpaceID unsignedLongLongValue];
-        snapshot.valid = !snapshot.displayIdentifier.empty() && snapshot.managedSpaceID != 0;
-        if (snapshot.valid) break;
+        OwnedVirtualDisplaySpaceEntry entry;
+        entry.displayIdentifier = StringFromNSString(displayIdentifier);
+        entry.spaceUUID = StringFromNSString([currentSpace objectForKey:@"uuid"]);
+        entry.managedSpaceID = [managedSpaceID unsignedLongLongValue];
+        if (!entry.displayIdentifier.empty() && entry.managedSpaceID != 0) {
+            snapshot.displays.push_back(std::move(entry));
+        }
     }
     CFRelease(rawSpaces);
+    snapshot.valid = !snapshot.displays.empty();
     if (snapshot.valid) {
-        NSLog(@"Owned virtual display captured current Space: display=%@ space=%llu uuid=%@",
-              [NSString stringWithUTF8String:snapshot.displayIdentifier.c_str()],
-              static_cast<unsigned long long>(snapshot.managedSpaceID),
-              [NSString stringWithUTF8String:snapshot.spaceUUID.c_str()]);
+        NSLog(@"Owned virtual display captured current Spaces: count=%lu",
+              static_cast<unsigned long>(snapshot.displays.size()));
     }
     return snapshot;
+}
+
+bool FindOwnedDisplaySpaceTarget(NSArray *displays,
+                                 const OwnedVirtualDisplaySpaceEntry &entry,
+                                 std::string *targetDisplayIdentifier,
+                                 uint64_t *targetSpaceID,
+                                 std::string *targetSpaceUUID) {
+    if (displays == nil || targetDisplayIdentifier == nullptr || targetSpaceID == nullptr ||
+        targetSpaceUUID == nullptr) {
+        return false;
+    }
+    *targetDisplayIdentifier = {};
+    *targetSpaceID = 0;
+    targetSpaceUUID->clear();
+    NSString *expectedDisplay = entry.displayIdentifier.empty()
+        ? nil
+        : [NSString stringWithUTF8String:entry.displayIdentifier.c_str()];
+    NSString *expectedSpace = entry.spaceUUID.empty()
+        ? nil
+        : [NSString stringWithUTF8String:entry.spaceUUID.c_str()];
+
+    auto inspectDisplay = [&](NSDictionary *display, bool requireDisplayMatch,
+                              bool requireSpaceUUID) -> bool {
+        NSString *displayIdentifier = [display objectForKey:@"Display Identifier"];
+        NSArray *spaces = [display objectForKey:@"Spaces"];
+        if (displayIdentifier == nil || ![spaces isKindOfClass:[NSArray class]]) return false;
+        if (requireDisplayMatch &&
+            (expectedDisplay == nil || ![displayIdentifier isEqualToString:expectedDisplay])) {
+            return false;
+        }
+        for (NSDictionary *space in spaces) {
+            NSString *spaceUUID = [space objectForKey:@"uuid"];
+            NSNumber *managedSpaceID = [space objectForKey:@"ManagedSpaceID"];
+            if (managedSpaceID == nil) continue;
+            bool uuidMatches = expectedSpace != nil && spaceUUID != nil &&
+                [spaceUUID isEqualToString:expectedSpace];
+            bool idMatches = [managedSpaceID unsignedLongLongValue] == entry.managedSpaceID;
+            if ((requireSpaceUUID && !uuidMatches) || (!requireSpaceUUID && !uuidMatches && !idMatches)) {
+                continue;
+            }
+            *targetDisplayIdentifier = StringFromNSString(displayIdentifier);
+            *targetSpaceID = [managedSpaceID unsignedLongLongValue];
+            *targetSpaceUUID = StringFromNSString(spaceUUID);
+            return *targetSpaceID != 0 && !targetDisplayIdentifier->empty();
+        }
+        return false;
+    };
+
+    // Prefer the original display and stable Space UUID so a fullscreen Space
+    // is not restored to a different physical display after reordering.
+    if (expectedDisplay != nil) {
+        for (NSDictionary *display in displays) {
+            if (inspectDisplay(display, true, true)) return true;
+        }
+    }
+    // The display identifier can change during a CGVirtualDisplay transition;
+    // the Space UUID normally survives that topology change.
+    if (expectedSpace != nil) {
+        for (NSDictionary *display in displays) {
+            if (inspectDisplay(display, false, true)) return true;
+        }
+    }
+    // Managed IDs are ephemeral, but are the final fallback on older macOS
+    // responses that omit a Space UUID.
+    if (expectedDisplay != nil) {
+        for (NSDictionary *display in displays) {
+            if (inspectDisplay(display, true, false)) return true;
+        }
+    }
+    for (NSDictionary *display in displays) {
+        if (inspectDisplay(display, false, false)) return true;
+    }
+    return false;
 }
 
 bool RestoreOwnedDisplaySpace(const OwnedVirtualDisplaySpaceSnapshot &snapshot) {
@@ -911,83 +997,59 @@ bool RestoreOwnedDisplaySpace(const OwnedVirtualDisplaySpaceSnapshot &snapshot) 
     }
 
     SkyLightConnectionID connection = functions.mainConnectionID();
-    std::string targetDisplayIdentifier;
-    uint64_t targetSpaceID = 0;
-    CFArrayRef rawSpaces = functions.copyManagedDisplaySpaces(connection);
-    if (rawSpaces != nullptr) {
-        NSArray *displays = (NSArray *)rawSpaces;
-        // Prefer the same stable Space UUID. Display identifiers can change
-        // when CGVirtualDisplay replaces the main output, while Space UUIDs
-        // normally survive that topology change.
-        for (NSDictionary *display in displays) {
-            NSString *displayIdentifier = [display objectForKey:@"Display Identifier"];
-            NSArray *spaces = [display objectForKey:@"Spaces"];
-            if (displayIdentifier == nil || ![spaces isKindOfClass:[NSArray class]]) continue;
-            for (NSDictionary *space in spaces) {
-                NSString *spaceUUID = [space objectForKey:@"uuid"];
-                NSNumber *managedSpaceID = [space objectForKey:@"ManagedSpaceID"];
-                if (spaceUUID != nil && managedSpaceID != nil &&
-                    !snapshot.spaceUUID.empty() &&
-                    [spaceUUID isEqualToString:[NSString stringWithUTF8String:snapshot.spaceUUID.c_str()]]) {
-                    targetDisplayIdentifier = StringFromNSString(displayIdentifier);
-                    targetSpaceID = [managedSpaceID unsignedLongLongValue];
+    for (const OwnedVirtualDisplaySpaceEntry &entry : snapshot.displays) {
+        bool restored = false;
+        // WindowServer can publish topology and fullscreen transitions in
+        // separate callbacks. Re-resolve the target for every attempt rather
+        // than keeping a stale display mapping.
+        for (int attempt = 0; attempt < 10 && !restored; ++attempt) {
+            std::string targetDisplayIdentifier;
+            std::string targetSpaceUUID;
+            uint64_t targetSpaceID = 0;
+            CFArrayRef rawSpaces = functions.copyManagedDisplaySpaces(connection);
+            if (rawSpaces != nullptr) {
+                NSArray *displays = (NSArray *)rawSpaces;
+                FindOwnedDisplaySpaceTarget(displays, entry, &targetDisplayIdentifier,
+                                             &targetSpaceID, &targetSpaceUUID);
+                if (!targetDisplayIdentifier.empty() && targetSpaceID != 0) {
+                    NSString *display = [NSString stringWithUTF8String:targetDisplayIdentifier.c_str()];
+                    if (display != nil) {
+                        functions.setCurrentSpace(connection, (CFStringRef)display, targetSpaceID);
+                    }
+                }
+                CFRelease(rawSpaces);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(150));
+            CFArrayRef verifyRaw = functions.copyManagedDisplaySpaces(connection);
+            if (verifyRaw != nullptr && !targetDisplayIdentifier.empty() && targetSpaceID != 0) {
+                NSArray *verifyDisplays = (NSArray *)verifyRaw;
+                NSString *display = [NSString stringWithUTF8String:targetDisplayIdentifier.c_str()];
+                NSString *expectedUUID = targetSpaceUUID.empty()
+                    ? nil
+                    : [NSString stringWithUTF8String:targetSpaceUUID.c_str()];
+                for (NSDictionary *verifyDisplay in verifyDisplays) {
+                    NSString *verifyIdentifier = [verifyDisplay objectForKey:@"Display Identifier"];
+                    if (verifyIdentifier == nil || display == nil ||
+                        ![verifyIdentifier isEqualToString:display]) continue;
+                    NSDictionary *currentSpace = [verifyDisplay objectForKey:@"Current Space"];
+                    NSNumber *currentID = [currentSpace objectForKey:@"ManagedSpaceID"];
+                    NSString *currentUUID = [currentSpace objectForKey:@"uuid"];
+                    restored = (currentID != nil &&
+                                [currentID unsignedLongLongValue] == targetSpaceID) ||
+                               (expectedUUID != nil &&
+                                [currentUUID isEqualToString:expectedUUID]);
                     break;
                 }
-            }
-            if (targetSpaceID != 0) break;
-        }
-        // If WindowServer did not expose a UUID for the old Space, preserve
-        // the managed ID on the new (single) display as a conservative fallback.
-        if (targetSpaceID == 0 && [displays count] > 0) {
-            NSDictionary *display = [displays objectAtIndex:0];
-            targetDisplayIdentifier = StringFromNSString([display objectForKey:@"Display Identifier"]);
-            NSArray *spaces = [display objectForKey:@"Spaces"];
-            for (NSDictionary *space in spaces) {
-                NSNumber *managedSpaceID = [space objectForKey:@"ManagedSpaceID"];
-                if ([managedSpaceID unsignedLongLongValue] == snapshot.managedSpaceID) {
-                    targetSpaceID = snapshot.managedSpaceID;
-                    break;
-                }
+                CFRelease(verifyRaw);
+            } else if (verifyRaw != nullptr) {
+                CFRelease(verifyRaw);
             }
         }
-        CFRelease(rawSpaces);
+        if (!restored) return false;
     }
-    if (targetDisplayIdentifier.empty() || targetSpaceID == 0) return false;
-
-    NSString *display = [NSString stringWithUTF8String:targetDisplayIdentifier.c_str()];
-    if (display == nil) return false;
-    NSString *expectedUUID = snapshot.spaceUUID.empty()
-        ? nil
-        : [NSString stringWithUTF8String:snapshot.spaceUUID.c_str()];
-    for (int attempt = 0; attempt < 3; ++attempt) {
-        functions.setCurrentSpace(connection, (CFStringRef)display, targetSpaceID);
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        CFArrayRef verifyRaw = functions.copyManagedDisplaySpaces(connection);
-        bool matched = false;
-        if (verifyRaw != nullptr) {
-            NSArray *verifyDisplays = (NSArray *)verifyRaw;
-            for (NSDictionary *verifyDisplay in verifyDisplays) {
-                NSString *verifyIdentifier = [verifyDisplay objectForKey:@"Display Identifier"];
-                if (verifyIdentifier == nil ||
-                    ![verifyIdentifier isEqualToString:display]) continue;
-                NSDictionary *currentSpace = [verifyDisplay objectForKey:@"Current Space"];
-                NSNumber *currentID = [currentSpace objectForKey:@"ManagedSpaceID"];
-                NSString *currentUUID = [currentSpace objectForKey:@"uuid"];
-                matched = (currentID != nil &&
-                           [currentID unsignedLongLongValue] == targetSpaceID) ||
-                          (expectedUUID != nil &&
-                           [currentUUID isEqualToString:expectedUUID]);
-                break;
-            }
-            CFRelease(verifyRaw);
-        }
-        if (matched) {
-            NSLog(@"Owned virtual display restored current Space: display=%@ space=%llu",
-                  display, static_cast<unsigned long long>(targetSpaceID));
-            return true;
-        }
-    }
-    return false;
+    NSLog(@"Owned virtual display restored current Spaces: count=%lu",
+          static_cast<unsigned long>(snapshot.displays.size()));
+    return true;
 }
 
 std::mutex g_ownedVirtualDisplayMutex;
