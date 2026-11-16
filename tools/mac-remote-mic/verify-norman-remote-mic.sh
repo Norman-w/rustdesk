@@ -102,7 +102,7 @@ if [ -x "$rustdesk_executable" ] && [ -f "$rustdesk_library" ]; then
     warn "installed NormanRemoteDesktop does not contain the Norman receiver route; it remains speaker-only"
   fi
 else
-  warn "NormanRemoteDesktop 1.4.10 was not found at $rustdesk"
+  warn "NormanRemoteDesktop 1.5.0 was not found at $rustdesk"
 fi
 
 if [ "$strict" = true ] && [ "$failures" -eq 0 ] && [ "$warnings" -gt 0 ]; then

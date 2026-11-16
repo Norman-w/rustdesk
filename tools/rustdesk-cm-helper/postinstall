@@ -34,7 +34,7 @@ for candidate in \
 done
 
 if [ ! -f "$app_info" ] || [ ! -x "$app_executable" ] || [ ! -f "$app_library" ]; then
-  echo "NormanRemoteDesktop 1.4.10 is not installed at $app_path."
+  echo "NormanRemoteDesktop 1.5.0 is not installed at $app_path."
   exit 1
 fi
 
@@ -44,8 +44,8 @@ if [ "$bundle_identifier" != "com.carriez.NormanRemoteDesktop" ]; then
   echo "The installed application is not the expected NormanRemoteDesktop bundle."
   exit 1
 fi
-if [ "$bundle_version" != "1.4.10" ]; then
-  echo "This helper package requires NormanRemoteDesktop 1.4.10; found $bundle_version."
+if [ "$bundle_version" != "1.5.0" ]; then
+  echo "This helper package requires NormanRemoteDesktop 1.5.0; found $bundle_version."
   exit 1
 fi
 if ! { /usr/bin/strings -a "$app_executable"; /usr/bin/strings -a "$app_library"; } |
