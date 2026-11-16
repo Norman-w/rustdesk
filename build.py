@@ -280,7 +280,10 @@ def get_features(args):
         features.append('vram')
     if args.flutter:
         features.append('flutter')
-    if args.unix_file_copy_paste:
+    # macOS uses the native NSPasteboard implementation for file clipboard
+    # support. Ship it in every macOS build so a Mac controller can copy a
+    # file once and paste it repeatedly on a remote Mac.
+    if args.unix_file_copy_paste or osx:
         features.append('unix-file-copy-paste')
     if osx:
         if args.screencapturekit:

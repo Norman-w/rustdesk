@@ -188,7 +188,7 @@ jobs:
 
       - name: Build rustdesk
         run: |
-          ./build.py --flutter ${{ matrix.job.extra-build-args }}
+          ./build.py --flutter --unix-file-copy-paste ${{ matrix.job.extra-build-args }}
 
       - name: create unsigned dmg
         run: |
