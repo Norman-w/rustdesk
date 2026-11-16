@@ -371,6 +371,8 @@ pub(super) struct CapturerInfo {
     pub current: usize,
     pub privacy_mode_id: i32,
     pub _capturer_privacy_mode_id: i32,
+    #[cfg(target_os = "macos")]
+    pub display_id: Option<u32>,
     pub capturer: Box<dyn TraitCapturer>,
 }
 
@@ -478,6 +480,8 @@ fn get_capturer_monitor(
         current,
         privacy_mode_id,
         _capturer_privacy_mode_id: capturer_privacy_mode_id,
+        #[cfg(target_os = "macos")]
+        display_id: name.parse::<u32>().ok(),
         capturer,
     })
 }
@@ -519,6 +523,8 @@ fn get_capturer_camera(current: usize) -> ResultType<CapturerInfo> {
         current,
         privacy_mode_id,
         _capturer_privacy_mode_id: privacy_mode_id,
+        #[cfg(target_os = "macos")]
+        display_id: None,
         capturer,
     });
 }
@@ -721,8 +727,16 @@ fn run(vs: VideoService) -> ResultType<()> {
 
         let time = now - start;
         let ms = (time.as_secs() * 1000 + time.subsec_millis() as u64) as i64;
+        #[cfg(target_os = "macos")]
+        let frame_display_id = c.display_id;
         let res = match c.frame(spf) {
             Ok(frame) => {
+                // Stamp the capture result itself. The owned-display manager
+                // may be blocked in CoreGraphics while this frame waits in its
+                // command queue, so queue-handling time is not an observation
+                // time.
+                #[cfg(target_os = "macos")]
+                let frame_observed_at = Instant::now();
                 repeat_encode_counter = 0;
                 if frame.valid() {
                     let screenshot_key = (vs.source, display_idx);
@@ -773,6 +787,14 @@ fn run(vs: VideoService) -> ResultType<()> {
                     }
 
                     let frame = frame.to(encoder.yuvfmt(), &mut yuv, &mut mid_data)?;
+                    #[cfg(target_os = "macos")]
+                    let frame_source = if vs.source.is_monitor() {
+                        frame_display_id.map(|display_id| (display_id, frame_observed_at))
+                    } else {
+                        None
+                    };
+                    #[cfg(not(target_os = "macos"))]
+                    let frame_source = None;
                     let send_conn_ids = handle_one_frame(
                         display_idx,
                         &sp,
@@ -784,6 +806,7 @@ fn run(vs: VideoService) -> ResultType<()> {
                         &mut first_frame,
                         capture_width,
                         capture_height,
+                        frame_source,
                     )?;
                     frame_controller.set_send(now, send_conn_ids);
                     send_counter += 1;
@@ -843,6 +866,7 @@ fn run(vs: VideoService) -> ResultType<()> {
                             &mut first_frame,
                             capture_width,
                             capture_height,
+                            None,
                         )?;
                         frame_controller.set_send(now, send_conn_ids);
                         send_counter += 1;
@@ -1145,6 +1169,7 @@ fn handle_one_frame(
     first_frame: &mut bool,
     width: usize,
     height: usize,
+    _frame_source: Option<(u32, Instant)>,
 ) -> ResultType<HashSet<i32>> {
     sp.snapshot(|sps| {
         // so that new sub and old sub share the same encoder after switch
@@ -1170,6 +1195,28 @@ fn handle_one_frame(
                 .as_mut()
                 .map(|r| r.write_message(&msg, width, height));
             send_conn_ids = sp.send_video_frame(msg);
+            #[cfg(target_os = "macos")]
+            if let (Some((display_id, observed_at)), Ok(display_index), Ok(width), Ok(height)) = (
+                _frame_source,
+                i32::try_from(display),
+                u32::try_from(width),
+                u32::try_from(height),
+            ) {
+                // VideoFrame carries a display index but no dimensions. These
+                // sizes come from the live capturer that supplied this exact
+                // frame and whose dimensions configured the encoder; do not
+                // infer them from a possibly stale PeerInfo/SwitchDisplay map.
+                for connection in &send_conn_ids {
+                    super::owned_virtual_display_runtime::observe_frame(
+                        *connection,
+                        display_id,
+                        display_index,
+                        width,
+                        height,
+                        observed_at,
+                    );
+                }
+            }
         }
         Err(e) => {
             *encode_fail_counter += 1;

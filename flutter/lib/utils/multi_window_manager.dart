@@ -171,9 +171,9 @@ class RustDeskMultiWindowManager {
         overrideType: type,
       ));
     }
-    if (isMacOS) {
-      Future.microtask(() => windowController.show());
-    }
+    // The child engine shows the window after Flutter has built its content
+    // and restored its position. Showing it here causes a black pre-render
+    // frame on macOS and can race the first remote session event.
     registerActiveWindow(windowId);
     windows.add(windowId);
     return windowId;
@@ -205,8 +205,11 @@ class RustDeskMultiWindowManager {
                   windowId: windowId, peerId: remoteId);
             }
             await DesktopMultiWindow.invokeMethod(windowId, methodName, msg);
-            if (methodName != kWindowEventNewRemoteDesktop) {
-              WindowController.fromWindowId(windowId).show();
+            // macOS remote windows are hidden after their last tab closes.
+            // Show the reused remote window after its new tab is installed;
+            // keep the existing behavior for other platforms and window types.
+            if (isMacOS || methodName != kWindowEventNewRemoteDesktop) {
+              await WindowController.fromWindowId(windowId).show();
             }
             registerActiveWindow(windowId);
             return MultiWindowCallResult(windowId, null);
@@ -472,7 +475,8 @@ class RustDeskMultiWindowManager {
     }
     for (int i = 0; i < windows.length; i++) {
       final wId = windows[i];
-      final shouldSavePos = type != WindowType.Terminal || i == windows.length - 1;
+      final shouldSavePos =
+          type != WindowType.Terminal || i == windows.length - 1;
       if (shouldSavePos) {
         debugPrint("closing multi window, type: ${type.toString()} id: $wId");
         try {

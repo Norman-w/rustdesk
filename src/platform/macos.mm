@@ -5,11 +5,488 @@
 #include <Security/AuthorizationTags.h>
 
 #include <CoreGraphics/CoreGraphics.h>
+#include <CoreAudio/CoreAudio.h>
+#include <CoreFoundation/CoreFoundation.h>
+#include <dispatch/dispatch.h>
 #include <vector>
 #include <map>
 #include <set>
 #include <mutex>
 #include <string>
+#include <atomic>
+#include <chrono>
+#include <thread>
+#include <cstdint>
+#include <cmath>
+#include <utility>
+#include <dlfcn.h>
+
+// Private CoreGraphics runtime interfaces used for an explicitly requested,
+// session-owned headless display. Keep these declarations local to this file.
+@interface CGVirtualDisplay : NSObject
+@property(readonly, nonatomic) unsigned int displayID;
+- (instancetype)initWithDescriptor:(id)descriptor;
+- (BOOL)applySettings:(id)settings;
+@end
+
+@interface CGVirtualDisplayDescriptor : NSObject
+@property(nonatomic) unsigned int vendorID;
+@property(nonatomic) unsigned int productID;
+@property(nonatomic) unsigned int serialNum;
+@property(nonatomic) unsigned int serialNumber API_AVAILABLE(macos(11.0));
+@property(retain, nonatomic) NSString *name;
+@property(nonatomic) CGSize sizeInMillimeters;
+@property(nonatomic) unsigned int maxPixelsWide;
+@property(nonatomic) unsigned int maxPixelsHigh;
+@property(nonatomic) CGPoint redPrimary;
+@property(nonatomic) CGPoint greenPrimary;
+@property(nonatomic) CGPoint bluePrimary;
+@property(nonatomic) CGPoint whitePoint;
+@property(retain, nonatomic) id queue;
+@property(copy, nonatomic) id terminationHandler;
+- (instancetype)init;
+@end
+
+@interface CGVirtualDisplayMode : NSObject
+- (instancetype)initWithWidth:(unsigned int)width
+                       height:(unsigned int)height
+                  refreshRate:(double)refreshRate;
+@end
+
+@interface CGVirtualDisplaySettings : NSObject
+@property(retain, nonatomic) NSArray *modes;
+@property(nonatomic) unsigned int hiDPI;
+@property(nonatomic) unsigned int rotation API_AVAILABLE(macos(11.0));
+- (instancetype)init;
+@end
+
+namespace {
+std::mutex g_remote_mic_route_mutex;
+AudioDeviceID g_saved_remote_mic_input = kAudioObjectUnknown;
+unsigned int g_remote_mic_route_users = 0;
+
+AudioObjectPropertyAddress remote_mic_property_address(
+    AudioObjectPropertySelector selector,
+    AudioObjectPropertyScope scope,
+    AudioObjectPropertyElement element) {
+    AudioObjectPropertyAddress address = {selector, scope, element};
+    return address;
+}
+
+AudioDeviceID find_remote_mic_input(const char *requested_name) {
+    if (requested_name == nullptr || requested_name[0] == '\0') {
+        return kAudioObjectUnknown;
+    }
+
+    CFStringRef requested = CFStringCreateWithCString(
+        kCFAllocatorDefault, requested_name, kCFStringEncodingUTF8);
+    if (requested == nullptr) {
+        return kAudioObjectUnknown;
+    }
+
+    const auto devices_address = remote_mic_property_address(
+        kAudioHardwarePropertyDevices,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain);
+    UInt32 data_size = 0;
+    OSStatus status = AudioObjectGetPropertyDataSize(
+        kAudioObjectSystemObject, &devices_address, 0, nullptr, &data_size);
+    if (status != noErr || data_size < sizeof(AudioDeviceID)) {
+        CFRelease(requested);
+        return kAudioObjectUnknown;
+    }
+
+    std::vector<AudioDeviceID> devices(data_size / sizeof(AudioDeviceID));
+    status = AudioObjectGetPropertyData(
+        kAudioObjectSystemObject,
+        &devices_address,
+        0,
+        nullptr,
+        &data_size,
+        devices.data());
+    if (status != noErr) {
+        CFRelease(requested);
+        return kAudioObjectUnknown;
+    }
+
+    const auto name_address = remote_mic_property_address(
+        kAudioObjectPropertyName,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain);
+    const auto input_stream_address = remote_mic_property_address(
+        kAudioDevicePropertyStreamConfiguration,
+        kAudioObjectPropertyScopeInput,
+        kAudioObjectPropertyElementMain);
+
+    AudioDeviceID result = kAudioObjectUnknown;
+    for (AudioDeviceID device : devices) {
+        UInt32 name_size = sizeof(CFStringRef);
+        CFStringRef device_name = nullptr;
+        if (AudioObjectGetPropertyData(
+                device, &name_address, 0, nullptr, &name_size, &device_name) != noErr ||
+            device_name == nullptr ||
+            CFStringCompare(device_name, requested, 0) != kCFCompareEqualTo) {
+            continue;
+        }
+
+        UInt32 stream_size = 0;
+        if (AudioObjectGetPropertyDataSize(
+                device, &input_stream_address, 0, nullptr, &stream_size) != noErr ||
+            stream_size < sizeof(AudioBufferList)) {
+            continue;
+        }
+
+        std::vector<UInt32> storage(
+            (stream_size + sizeof(UInt32) - 1) / sizeof(UInt32));
+        auto *buffers = reinterpret_cast<AudioBufferList *>(storage.data());
+        if (AudioObjectGetPropertyData(
+                device,
+                &input_stream_address,
+                0,
+                nullptr,
+                &stream_size,
+                buffers) != noErr) {
+            continue;
+        }
+
+        bool has_input = false;
+        for (UInt32 i = 0; i < buffers->mNumberBuffers; ++i) {
+            if (buffers->mBuffers[i].mNumberChannels > 0) {
+                has_input = true;
+                break;
+            }
+        }
+        if (has_input) {
+            result = device;
+            break;
+        }
+    }
+
+    CFRelease(requested);
+    return result;
+}
+
+bool get_default_remote_mic_input(AudioDeviceID *device) {
+    if (device == nullptr) {
+        return false;
+    }
+    const auto address = remote_mic_property_address(
+        kAudioHardwarePropertyDefaultInputDevice,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain);
+    UInt32 data_size = sizeof(*device);
+    return AudioObjectGetPropertyData(
+               kAudioObjectSystemObject, &address, 0, nullptr, &data_size, device) == noErr &&
+        *device != kAudioObjectUnknown;
+}
+
+bool set_default_remote_mic_input(AudioDeviceID device) {
+    if (device == kAudioObjectUnknown) {
+        return false;
+    }
+    const auto address = remote_mic_property_address(
+        kAudioHardwarePropertyDefaultInputDevice,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain);
+    UInt32 data_size = sizeof(device);
+    return AudioObjectSetPropertyData(
+               kAudioObjectSystemObject, &address, 0, nullptr, data_size, &device) == noErr;
+}
+
+AudioDeviceID find_remote_audio_output(const char *requested_name) {
+    if (requested_name == nullptr || requested_name[0] == '\0') {
+        return kAudioObjectUnknown;
+    }
+
+    CFStringRef requested = CFStringCreateWithCString(
+        kCFAllocatorDefault, requested_name, kCFStringEncodingUTF8);
+    if (requested == nullptr) {
+        return kAudioObjectUnknown;
+    }
+
+    const auto devices_address = remote_mic_property_address(
+        kAudioHardwarePropertyDevices,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain);
+    UInt32 data_size = 0;
+    OSStatus status = AudioObjectGetPropertyDataSize(
+        kAudioObjectSystemObject, &devices_address, 0, nullptr, &data_size);
+    if (status != noErr || data_size < sizeof(AudioDeviceID)) {
+        CFRelease(requested);
+        return kAudioObjectUnknown;
+    }
+
+    std::vector<AudioDeviceID> devices(data_size / sizeof(AudioDeviceID));
+    status = AudioObjectGetPropertyData(
+        kAudioObjectSystemObject,
+        &devices_address,
+        0,
+        nullptr,
+        &data_size,
+        devices.data());
+    if (status != noErr) {
+        CFRelease(requested);
+        return kAudioObjectUnknown;
+    }
+
+    const auto name_address = remote_mic_property_address(
+        kAudioObjectPropertyName,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain);
+    const auto output_stream_address = remote_mic_property_address(
+        kAudioDevicePropertyStreamConfiguration,
+        kAudioObjectPropertyScopeOutput,
+        kAudioObjectPropertyElementMain);
+
+    AudioDeviceID result = kAudioObjectUnknown;
+    for (AudioDeviceID device : devices) {
+        UInt32 name_size = sizeof(CFStringRef);
+        CFStringRef device_name = nullptr;
+        if (AudioObjectGetPropertyData(
+                device, &name_address, 0, nullptr, &name_size, &device_name) != noErr ||
+            device_name == nullptr ||
+            CFStringCompare(device_name, requested, 0) != kCFCompareEqualTo) {
+            continue;
+        }
+
+        UInt32 stream_size = 0;
+        if (AudioObjectGetPropertyDataSize(
+                device, &output_stream_address, 0, nullptr, &stream_size) != noErr ||
+            stream_size < sizeof(AudioBufferList)) {
+            continue;
+        }
+
+        std::vector<UInt32> storage(
+            (stream_size + sizeof(UInt32) - 1) / sizeof(UInt32));
+        auto *buffers = reinterpret_cast<AudioBufferList *>(storage.data());
+        if (AudioObjectGetPropertyData(
+                device,
+                &output_stream_address,
+                0,
+                nullptr,
+                &stream_size,
+                buffers) != noErr) {
+            continue;
+        }
+
+        bool has_output = false;
+        for (UInt32 i = 0; i < buffers->mNumberBuffers; ++i) {
+            if (buffers->mBuffers[i].mNumberChannels > 0) {
+                has_output = true;
+                break;
+            }
+        }
+        if (has_output) {
+            result = device;
+            break;
+        }
+    }
+
+    CFRelease(requested);
+    return result;
+}
+
+bool get_default_remote_audio_output(AudioDeviceID *device) {
+    if (device == nullptr) {
+        return false;
+    }
+    const auto address = remote_mic_property_address(
+        kAudioHardwarePropertyDefaultOutputDevice,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain);
+    UInt32 data_size = sizeof(*device);
+    return AudioObjectGetPropertyData(
+               kAudioObjectSystemObject, &address, 0, nullptr, &data_size, device) == noErr &&
+        *device != kAudioObjectUnknown;
+}
+
+bool set_default_remote_audio_output(AudioDeviceID device) {
+    if (device == kAudioObjectUnknown) {
+        return false;
+    }
+    const auto address = remote_mic_property_address(
+        kAudioHardwarePropertyDefaultOutputDevice,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain);
+    UInt32 data_size = sizeof(device);
+    return AudioObjectSetPropertyData(
+               kAudioObjectSystemObject, &address, 0, nullptr, data_size, &device) == noErr;
+}
+
+bool get_default_remote_system_output(AudioDeviceID *device) {
+    if (device == nullptr) {
+        return false;
+    }
+    const auto address = remote_mic_property_address(
+        kAudioHardwarePropertyDefaultSystemOutputDevice,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain);
+    UInt32 data_size = sizeof(*device);
+    return AudioObjectGetPropertyData(
+               kAudioObjectSystemObject, &address, 0, nullptr, &data_size, device) == noErr &&
+        *device != kAudioObjectUnknown;
+}
+
+bool set_default_remote_system_output(AudioDeviceID device) {
+    if (device == kAudioObjectUnknown) {
+        return false;
+    }
+    const auto address = remote_mic_property_address(
+        kAudioHardwarePropertyDefaultSystemOutputDevice,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain);
+    UInt32 data_size = sizeof(device);
+    return AudioObjectSetPropertyData(
+               kAudioObjectSystemObject, &address, 0, nullptr, data_size, &device) == noErr;
+}
+}  // namespace
+
+extern "C" bool MacBeginRemoteMicRoute(const char *requested_name) {
+    std::lock_guard<std::mutex> lock(g_remote_mic_route_mutex);
+    if (g_remote_mic_route_users > 0) {
+        ++g_remote_mic_route_users;
+        return true;
+    }
+
+    AudioDeviceID target = find_remote_mic_input(requested_name);
+    if (target == kAudioObjectUnknown) {
+        NSLog(@"Norman remote microphone input device is unavailable");
+        return false;
+    }
+
+    AudioDeviceID current = kAudioObjectUnknown;
+    if (!get_default_remote_mic_input(&current)) {
+        NSLog(@"Unable to read the current macOS default input device");
+        return false;
+    }
+
+    if (target != current && !set_default_remote_mic_input(target)) {
+        NSLog(@"Unable to set the macOS default input to the Norman virtual device");
+        return false;
+    }
+
+    g_saved_remote_mic_input = current;
+    g_remote_mic_route_users = 1;
+    NSLog(@"Norman remote microphone input route enabled");
+    return true;
+}
+
+extern "C" void MacEndRemoteMicRoute() {
+    std::lock_guard<std::mutex> lock(g_remote_mic_route_mutex);
+    if (g_remote_mic_route_users == 0) {
+        return;
+    }
+
+    --g_remote_mic_route_users;
+    if (g_remote_mic_route_users > 0) {
+        return;
+    }
+
+    if (g_saved_remote_mic_input != kAudioObjectUnknown &&
+        !set_default_remote_mic_input(g_saved_remote_mic_input)) {
+        NSLog(@"Unable to restore the previous macOS default input device");
+    } else {
+        NSLog(@"Norman remote microphone input route restored");
+    }
+    g_saved_remote_mic_input = kAudioObjectUnknown;
+}
+
+namespace {
+std::mutex g_remote_audio_route_mutex;
+AudioDeviceID g_saved_remote_audio_output = kAudioObjectUnknown;
+AudioDeviceID g_saved_remote_system_output = kAudioObjectUnknown;
+unsigned int g_remote_audio_route_users = 0;
+}  // namespace
+
+extern "C" bool MacBeginRemoteAudioRoute(const char *requested_name) {
+    std::lock_guard<std::mutex> lock(g_remote_audio_route_mutex);
+    if (g_remote_audio_route_users > 0) {
+        ++g_remote_audio_route_users;
+        return true;
+    }
+
+    AudioDeviceID target = find_remote_audio_output(requested_name);
+    if (target == kAudioObjectUnknown) {
+        NSLog(@"Norman Remote Audio output device is unavailable");
+        return false;
+    }
+
+    AudioDeviceID current_output = kAudioObjectUnknown;
+    AudioDeviceID current_system_output = kAudioObjectUnknown;
+    if (!get_default_remote_audio_output(&current_output) ||
+        !get_default_remote_system_output(&current_system_output)) {
+        NSLog(@"Unable to read the current macOS default output devices");
+        return false;
+    }
+
+    if (target != current_output && !set_default_remote_audio_output(target)) {
+        NSLog(@"Unable to set the macOS default output to Norman Remote Audio");
+        return false;
+    }
+    if (target != current_system_output && !set_default_remote_system_output(target)) {
+        if (target != current_output) {
+            set_default_remote_audio_output(current_output);
+        }
+        NSLog(@"Unable to set the macOS system output to Norman Remote Audio");
+        return false;
+    }
+
+    g_saved_remote_audio_output = current_output;
+    g_saved_remote_system_output = current_system_output;
+    g_remote_audio_route_users = 1;
+    NSLog(@"Norman Remote Audio output route enabled");
+    return true;
+}
+
+extern "C" bool MacEnsureRemoteAudioRoute(const char *requested_name) {
+    std::lock_guard<std::mutex> lock(g_remote_audio_route_mutex);
+    if (g_remote_audio_route_users == 0) {
+        return false;
+    }
+
+    AudioDeviceID target = find_remote_audio_output(requested_name);
+    if (target == kAudioObjectUnknown) {
+        return false;
+    }
+
+    AudioDeviceID current_output = kAudioObjectUnknown;
+    AudioDeviceID current_system_output = kAudioObjectUnknown;
+    if (!get_default_remote_audio_output(&current_output) ||
+        !get_default_remote_system_output(&current_system_output)) {
+        return false;
+    }
+
+    bool ok = true;
+    if (target != current_output && !set_default_remote_audio_output(target)) {
+        ok = false;
+    }
+    if (target != current_system_output && !set_default_remote_system_output(target)) {
+        ok = false;
+    }
+    return ok;
+}
+
+extern "C" void MacEndRemoteAudioRoute() {
+    std::lock_guard<std::mutex> lock(g_remote_audio_route_mutex);
+    if (g_remote_audio_route_users == 0) {
+        return;
+    }
+
+    --g_remote_audio_route_users;
+    if (g_remote_audio_route_users > 0) {
+        return;
+    }
+
+    if (g_saved_remote_audio_output != kAudioObjectUnknown) {
+        set_default_remote_audio_output(g_saved_remote_audio_output);
+    }
+    if (g_saved_remote_system_output != kAudioObjectUnknown) {
+        set_default_remote_system_output(g_saved_remote_system_output);
+    }
+    NSLog(@"Norman Remote Audio output route restored");
+    g_saved_remote_audio_output = kAudioObjectUnknown;
+    g_saved_remote_system_output = kAudioObjectUnknown;
+}
 
 extern "C" bool CanUseNewApiForScreenCaptureCheck() {
     #ifdef NO_InputMonitoringAuthStatus
@@ -300,6 +777,793 @@ extern "C" bool MacSetMode(CGDirectDisplayID display, uint32_t width, uint32_t h
     CGDisplayModeRelease(currentMode);
     CFRelease(allModes);
     return ret;
+}
+
+namespace {
+constexpr uint32_t kOwnedVirtualDisplayVendorID = 0x4e52;   // "NR"
+constexpr uint32_t kOwnedVirtualDisplayProductID = 0x30d1;  // RustDesk-owned display.
+constexpr uint32_t kOwnedVirtualDisplayMaxDimension = 4096;
+constexpr uint64_t kOwnedVirtualDisplayMaxPixels = 8388608;
+constexpr uint32_t kOwnedVirtualDisplayAlignment = 2;
+constexpr unsigned int kOwnedVirtualDisplayMinDimension = 320;
+constexpr unsigned int kOwnedVirtualDisplayFullscreenSpaceType = 4;
+constexpr auto kOwnedVirtualDisplayStabilityTimeout = std::chrono::seconds(8);
+constexpr auto kOwnedVirtualDisplayReleaseTimeout = std::chrono::seconds(5);
+
+enum OwnedVirtualDisplayStatus : int32_t {
+    kOwnedVirtualDisplayOk = 0,
+    kOwnedVirtualDisplayInvalidArgument = 1,
+    kOwnedVirtualDisplayRuntimeUnavailable = 2,
+    kOwnedVirtualDisplayUnsafeTopology = 3,
+    kOwnedVirtualDisplayBusyOwner = 4,
+    kOwnedVirtualDisplayStaleGeneration = 5,
+    kOwnedVirtualDisplayCreateFailed = 6,
+    kOwnedVirtualDisplayApplyFailed = 7,
+    kOwnedVirtualDisplayStabilityTimeoutStatus = 8,
+    kOwnedVirtualDisplayRestoreFailed = 9,
+};
+
+struct OwnedVirtualDisplayState {
+    CGVirtualDisplay *display = nil;
+    CGVirtualDisplayDescriptor *descriptor = nil;
+    CGVirtualDisplaySettings *settings = nil;
+    uint64_t ownerToken = 0;
+    uint64_t generation = 0;
+    uint32_t displayID = 0;
+    uint32_t serial = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    bool reconfigurationCallbackRegistered = false;
+};
+
+// SkyLight owns the macOS Space bookkeeping. CGVirtualDisplay creation and
+// reconfiguration can replace the session's main display, which makes the
+// current Space appear to jump even when no application is activated. Keep
+// this bridge dynamically loaded: SkyLight is a private framework and must
+// remain optional on systems where the symbols are unavailable.
+using SkyLightConnectionID = int32_t;
+using SkyLightMainConnectionIDFn = SkyLightConnectionID (*)();
+using SkyLightCopyManagedDisplaySpacesFn = CFArrayRef (*)(SkyLightConnectionID);
+using SkyLightManagedDisplaySetCurrentSpaceFn = void (*)(SkyLightConnectionID,
+                                                          CFStringRef,
+                                                          uint64_t);
+
+struct SkyLightFunctions {
+    void *handle = nullptr;
+    SkyLightMainConnectionIDFn mainConnectionID = nullptr;
+    SkyLightCopyManagedDisplaySpacesFn copyManagedDisplaySpaces = nullptr;
+    SkyLightManagedDisplaySetCurrentSpaceFn setCurrentSpace = nullptr;
+};
+
+SkyLightFunctions LoadSkyLightFunctions() {
+    static std::once_flag once;
+    static SkyLightFunctions functions;
+    std::call_once(once, [] {
+        functions.handle = dlopen(
+            "/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight",
+            RTLD_LAZY | RTLD_LOCAL);
+        auto resolve = [](void *handle, const char *name) -> void * {
+            void *symbol = dlsym(RTLD_DEFAULT, name);
+            if (symbol == nullptr && handle != nullptr) symbol = dlsym(handle, name);
+            return symbol;
+        };
+        functions.mainConnectionID = reinterpret_cast<SkyLightMainConnectionIDFn>(
+            resolve(functions.handle, "CGSMainConnectionID"));
+        functions.copyManagedDisplaySpaces =
+            reinterpret_cast<SkyLightCopyManagedDisplaySpacesFn>(
+                resolve(functions.handle, "CGSCopyManagedDisplaySpaces"));
+        functions.setCurrentSpace =
+            reinterpret_cast<SkyLightManagedDisplaySetCurrentSpaceFn>(
+                resolve(functions.handle, "CGSManagedDisplaySetCurrentSpace"));
+    });
+    return functions;
+}
+
+std::string StringFromNSString(NSString *value) {
+    if (value == nil) return {};
+    const char *utf8 = [value UTF8String];
+    return utf8 == nullptr ? std::string() : std::string(utf8);
+}
+
+struct OwnedVirtualDisplaySpaceEntry {
+    std::string displayIdentifier;
+    std::string spaceUUID;
+    uint64_t managedSpaceID = 0;
+};
+
+struct OwnedVirtualDisplaySpaceSnapshot {
+    std::vector<OwnedVirtualDisplaySpaceEntry> displays;
+    bool valid = false;
+};
+
+OwnedVirtualDisplaySpaceSnapshot CaptureCurrentOwnedDisplaySpace() {
+    OwnedVirtualDisplaySpaceSnapshot snapshot;
+    SkyLightFunctions functions = LoadSkyLightFunctions();
+    if (functions.mainConnectionID == nullptr || functions.copyManagedDisplaySpaces == nullptr) {
+        return snapshot;
+    }
+
+    CFArrayRef rawSpaces = functions.copyManagedDisplaySpaces(functions.mainConnectionID());
+    if (rawSpaces == nullptr) return snapshot;
+
+    NSArray *displays = (NSArray *)rawSpaces;
+    for (NSDictionary *display in displays) {
+        NSString *displayIdentifier = [display objectForKey:@"Display Identifier"];
+        NSDictionary *currentSpace = [display objectForKey:@"Current Space"];
+        NSNumber *managedSpaceID = [currentSpace objectForKey:@"ManagedSpaceID"];
+        NSNumber *spaceType = [currentSpace objectForKey:@"type"];
+        // A normal desktop Space must not be explicitly selected. Calling the
+        // private setter for an ordinary Space can itself move the user to a
+        // different display while WindowServer is rebuilding the topology.
+        if (displayIdentifier == nil || currentSpace == nil || managedSpaceID == nil ||
+            spaceType == nil || [spaceType unsignedIntValue] != kOwnedVirtualDisplayFullscreenSpaceType) {
+            continue;
+        }
+
+        OwnedVirtualDisplaySpaceEntry entry;
+        entry.displayIdentifier = StringFromNSString(displayIdentifier);
+        entry.spaceUUID = StringFromNSString([currentSpace objectForKey:@"uuid"]);
+        entry.managedSpaceID = [managedSpaceID unsignedLongLongValue];
+        if (!entry.displayIdentifier.empty() && entry.managedSpaceID != 0) {
+            snapshot.displays.push_back(std::move(entry));
+        }
+    }
+    CFRelease(rawSpaces);
+    snapshot.valid = !snapshot.displays.empty();
+    if (snapshot.valid) {
+        NSLog(@"Owned virtual display captured current Spaces: count=%lu",
+              static_cast<unsigned long>(snapshot.displays.size()));
+    }
+    return snapshot;
+}
+
+bool FindOwnedDisplaySpaceTarget(NSArray *displays,
+                                 const OwnedVirtualDisplaySpaceEntry &entry,
+                                 std::string *targetDisplayIdentifier,
+                                 uint64_t *targetSpaceID,
+                                 std::string *targetSpaceUUID) {
+    if (displays == nil || targetDisplayIdentifier == nullptr || targetSpaceID == nullptr ||
+        targetSpaceUUID == nullptr) {
+        return false;
+    }
+    *targetDisplayIdentifier = {};
+    *targetSpaceID = 0;
+    targetSpaceUUID->clear();
+    NSString *expectedDisplay = entry.displayIdentifier.empty()
+        ? nil
+        : [NSString stringWithUTF8String:entry.displayIdentifier.c_str()];
+    NSString *expectedSpace = entry.spaceUUID.empty()
+        ? nil
+        : [NSString stringWithUTF8String:entry.spaceUUID.c_str()];
+
+    auto inspectDisplay = [&](NSDictionary *display, bool requireDisplayMatch,
+                              bool requireSpaceUUID) -> bool {
+        NSString *displayIdentifier = [display objectForKey:@"Display Identifier"];
+        NSArray *spaces = [display objectForKey:@"Spaces"];
+        if (displayIdentifier == nil || ![spaces isKindOfClass:[NSArray class]]) return false;
+        if (requireDisplayMatch &&
+            (expectedDisplay == nil || ![displayIdentifier isEqualToString:expectedDisplay])) {
+            return false;
+        }
+        for (NSDictionary *space in spaces) {
+            NSString *spaceUUID = [space objectForKey:@"uuid"];
+            NSNumber *managedSpaceID = [space objectForKey:@"ManagedSpaceID"];
+            if (managedSpaceID == nil) continue;
+            bool uuidMatches = expectedSpace != nil && spaceUUID != nil &&
+                [spaceUUID isEqualToString:expectedSpace];
+            bool idMatches = [managedSpaceID unsignedLongLongValue] == entry.managedSpaceID;
+            if ((requireSpaceUUID && !uuidMatches) || (!requireSpaceUUID && !uuidMatches && !idMatches)) {
+                continue;
+            }
+            *targetDisplayIdentifier = StringFromNSString(displayIdentifier);
+            *targetSpaceID = [managedSpaceID unsignedLongLongValue];
+            *targetSpaceUUID = StringFromNSString(spaceUUID);
+            return *targetSpaceID != 0 && !targetDisplayIdentifier->empty();
+        }
+        return false;
+    };
+
+    // Prefer the original display and stable Space UUID so a fullscreen Space
+    // is not restored to a different physical display after reordering.
+    if (expectedDisplay != nil) {
+        for (NSDictionary *display in displays) {
+            if (inspectDisplay(display, true, true)) return true;
+        }
+    }
+    // The display identifier can change during a CGVirtualDisplay transition;
+    // the Space UUID normally survives that topology change.
+    if (expectedSpace != nil) {
+        for (NSDictionary *display in displays) {
+            if (inspectDisplay(display, false, true)) return true;
+        }
+    }
+    // Managed IDs are ephemeral, but are the final fallback on older macOS
+    // responses that omit a Space UUID.
+    if (expectedDisplay != nil) {
+        for (NSDictionary *display in displays) {
+            if (inspectDisplay(display, true, false)) return true;
+        }
+    }
+    for (NSDictionary *display in displays) {
+        if (inspectDisplay(display, false, false)) return true;
+    }
+    return false;
+}
+
+bool RestoreOwnedDisplaySpace(const OwnedVirtualDisplaySpaceSnapshot &snapshot) {
+    if (!snapshot.valid) return false;
+    SkyLightFunctions functions = LoadSkyLightFunctions();
+    if (functions.mainConnectionID == nullptr || functions.copyManagedDisplaySpaces == nullptr ||
+        functions.setCurrentSpace == nullptr) {
+        return false;
+    }
+
+    SkyLightConnectionID connection = functions.mainConnectionID();
+    for (const OwnedVirtualDisplaySpaceEntry &entry : snapshot.displays) {
+        bool restored = false;
+        // WindowServer can publish topology and fullscreen transitions in
+        // separate callbacks. Re-resolve the target for every attempt rather
+        // than keeping a stale display mapping.
+        for (int attempt = 0; attempt < 10 && !restored; ++attempt) {
+            std::string targetDisplayIdentifier;
+            std::string targetSpaceUUID;
+            uint64_t targetSpaceID = 0;
+            CFArrayRef rawSpaces = functions.copyManagedDisplaySpaces(connection);
+            if (rawSpaces != nullptr) {
+                NSArray *displays = (NSArray *)rawSpaces;
+                FindOwnedDisplaySpaceTarget(displays, entry, &targetDisplayIdentifier,
+                                             &targetSpaceID, &targetSpaceUUID);
+                if (!targetDisplayIdentifier.empty() && targetSpaceID != 0) {
+                    NSString *display = [NSString stringWithUTF8String:targetDisplayIdentifier.c_str()];
+                    if (display != nil) {
+                        functions.setCurrentSpace(connection, (CFStringRef)display, targetSpaceID);
+                    }
+                }
+                CFRelease(rawSpaces);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(150));
+            CFArrayRef verifyRaw = functions.copyManagedDisplaySpaces(connection);
+            if (verifyRaw != nullptr && !targetDisplayIdentifier.empty() && targetSpaceID != 0) {
+                NSArray *verifyDisplays = (NSArray *)verifyRaw;
+                NSString *display = [NSString stringWithUTF8String:targetDisplayIdentifier.c_str()];
+                NSString *expectedUUID = targetSpaceUUID.empty()
+                    ? nil
+                    : [NSString stringWithUTF8String:targetSpaceUUID.c_str()];
+                for (NSDictionary *verifyDisplay in verifyDisplays) {
+                    NSString *verifyIdentifier = [verifyDisplay objectForKey:@"Display Identifier"];
+                    if (verifyIdentifier == nil || display == nil ||
+                        ![verifyIdentifier isEqualToString:display]) continue;
+                    NSDictionary *currentSpace = [verifyDisplay objectForKey:@"Current Space"];
+                    NSNumber *currentID = [currentSpace objectForKey:@"ManagedSpaceID"];
+                    NSString *currentUUID = [currentSpace objectForKey:@"uuid"];
+                    restored = (currentID != nil &&
+                                [currentID unsignedLongLongValue] == targetSpaceID) ||
+                               (expectedUUID != nil &&
+                                [currentUUID isEqualToString:expectedUUID]);
+                    break;
+                }
+                CFRelease(verifyRaw);
+            } else if (verifyRaw != nullptr) {
+                CFRelease(verifyRaw);
+            }
+        }
+        if (!restored) return false;
+    }
+    NSLog(@"Owned virtual display restored current Spaces: count=%lu",
+          static_cast<unsigned long>(snapshot.displays.size()));
+    return true;
+}
+
+std::mutex g_ownedVirtualDisplayMutex;
+OwnedVirtualDisplayState g_ownedVirtualDisplay;
+std::atomic<uint64_t> g_ownedVirtualDisplayReconfigurationEvents{0};
+
+void OwnedVirtualDisplayReconfigurationCallback(CGDirectDisplayID display,
+                                                 CGDisplayChangeSummaryFlags flags,
+                                                 void *userInfo) {
+    (void)display;
+    (void)userInfo;
+    if (!(flags & kCGDisplayBeginConfigurationFlag)) {
+        g_ownedVirtualDisplayReconfigurationEvents.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+bool OwnedVirtualDisplayRuntimeAvailable() {
+    return NSClassFromString(@"CGVirtualDisplay") != Nil &&
+           NSClassFromString(@"CGVirtualDisplayDescriptor") != Nil &&
+           NSClassFromString(@"CGVirtualDisplayMode") != Nil &&
+           NSClassFromString(@"CGVirtualDisplaySettings") != Nil;
+}
+
+bool GetOnlineDisplayIDs(std::vector<CGDirectDisplayID> *ids) {
+    if (ids == nullptr) return false;
+    uint32_t count = 0;
+    if (CGGetOnlineDisplayList(0, nullptr, &count) != kCGErrorSuccess || count > 64) {
+        return false;
+    }
+    if (count == 0) {
+        ids->clear();
+        return true;
+    }
+    ids->resize(count);
+    if (CGGetOnlineDisplayList(count, ids->data(), &count) != kCGErrorSuccess || count > 64) {
+        ids->clear();
+        return false;
+    }
+    ids->resize(count);
+    return true;
+}
+
+bool IsHeadlessPlaceholder(CGDirectDisplayID displayID) {
+    return CGDisplayVendorNumber(displayID) == 0x756e6b6e &&
+           CGDisplayModelNumber(displayID) == 0x76697274 &&
+           CGDisplaySerialNumber(displayID) == 0 &&
+           !CGDisplayIsBuiltin(displayID) && CGDisplayIsActive(displayID) &&
+           CGDisplayIsOnline(displayID) && !CGDisplayIsInMirrorSet(displayID) &&
+           CGDisplayPixelsWide(displayID) > 0 && CGDisplayPixelsHigh(displayID) > 0;
+}
+
+bool IsOwnedVirtualDisplay(CGDirectDisplayID displayID) {
+    return g_ownedVirtualDisplay.display != nil &&
+           CGDisplayVendorNumber(displayID) == kOwnedVirtualDisplayVendorID &&
+           CGDisplayModelNumber(displayID) == kOwnedVirtualDisplayProductID &&
+           CGDisplaySerialNumber(displayID) == g_ownedVirtualDisplay.serial &&
+           !CGDisplayIsBuiltin(displayID) && CGDisplayIsActive(displayID) &&
+           CGDisplayIsOnline(displayID) && !CGDisplayIsInMirrorSet(displayID) &&
+           CGDisplayPixelsWide(displayID) > 0 && CGDisplayPixelsHigh(displayID) > 0;
+}
+
+CGDirectDisplayID FindOwnedVirtualDisplayID() {
+    std::vector<CGDirectDisplayID> ids;
+    if (!GetOnlineDisplayIDs(&ids)) return 0;
+    CGDirectDisplayID found = 0;
+    for (CGDirectDisplayID displayID : ids) {
+        if (!IsOwnedVirtualDisplay(displayID)) continue;
+        if (found != 0) return 0;
+        found = displayID;
+    }
+    return found;
+}
+
+bool OwnedVirtualDisplayTopologyIsSafe(bool requireOwnedDisplay) {
+    std::vector<CGDirectDisplayID> ids;
+    if (!GetOnlineDisplayIDs(&ids)) return false;
+    if (g_ownedVirtualDisplay.display == nil) {
+        return ids.size() == 1 && IsHeadlessPlaceholder(ids.front()) &&
+               CGMainDisplayID() == ids.front();
+    }
+
+    size_t ownedCount = 0;
+    size_t placeholderCount = 0;
+    for (CGDirectDisplayID displayID : ids) {
+        if (IsOwnedVirtualDisplay(displayID)) {
+            ++ownedCount;
+        } else if (IsHeadlessPlaceholder(displayID)) {
+            ++placeholderCount;
+        } else {
+            return false;
+        }
+    }
+    if (ownedCount > 1 || placeholderCount > 1) return false;
+    return !requireOwnedDisplay || ownedCount == 1;
+}
+
+CGVirtualDisplaySettings *CreateOwnedVirtualDisplaySettings(uint32_t width, uint32_t height) {
+    CGVirtualDisplaySettings *settings = nil;
+    CGVirtualDisplayMode *mode = nil;
+    NSArray *modes = nil;
+    @try {
+        settings = [[CGVirtualDisplaySettings alloc] init];
+        if (settings == nil) return nil;
+        mode = [[CGVirtualDisplayMode alloc]
+            initWithWidth:width height:height refreshRate:60.0];
+        if (mode == nil) {
+            [settings release];
+            return nil;
+        }
+        modes = [[NSArray alloc] initWithObjects:mode, nil];
+        settings.modes = modes;
+        settings.hiDPI = 0;
+        if (@available(macOS 11.0, *)) settings.rotation = 0;
+        [modes release];
+        modes = nil;
+        [mode release];
+        mode = nil;
+        return settings;
+    } @catch (NSException *exception) {
+        NSLog(@"Owned virtual display mode init exception: %@", exception.reason ?: @"unknown");
+        if (modes != nil) [modes release];
+        if (mode != nil) [mode release];
+        if (settings != nil) [settings release];
+        return nil;
+    }
+}
+
+CGVirtualDisplay *CreateOwnedVirtualDisplay(CGVirtualDisplayDescriptor **descriptorOut,
+                                            uint32_t width,
+                                            uint32_t height,
+                                            uint32_t *serialOut) {
+    if (descriptorOut == nullptr || serialOut == nullptr) return nil;
+    *descriptorOut = nil;
+    *serialOut = 0;
+
+    uint32_t serial = arc4random();
+    if (serial == 0) serial = 1;
+    NSString *displayName = [NSString stringWithFormat:@"NormanRemoteDesktop-%@", NSUUID.UUID.UUIDString];
+    CGVirtualDisplayDescriptor *descriptor = nil;
+    CGVirtualDisplay *display = nil;
+    @try {
+        descriptor = [[CGVirtualDisplayDescriptor alloc] init];
+        if (descriptor == nil) return nil;
+        descriptor.queue = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
+        descriptor.name = displayName;
+        descriptor.vendorID = kOwnedVirtualDisplayVendorID;
+        descriptor.productID = kOwnedVirtualDisplayProductID;
+        descriptor.serialNum = serial;
+        if (@available(macOS 11.0, *)) descriptor.serialNumber = serial;
+        descriptor.maxPixelsWide = kOwnedVirtualDisplayMaxDimension;
+        descriptor.maxPixelsHigh = kOwnedVirtualDisplayMaxDimension;
+        descriptor.sizeInMillimeters = CGSizeMake(25.4 * width / 96.0,
+                                                   25.4 * height / 96.0);
+        descriptor.whitePoint = CGPointMake(0.3125, 0.3291);
+        descriptor.bluePrimary = CGPointMake(0.1494, 0.0557);
+        descriptor.greenPrimary = CGPointMake(0.2559, 0.6983);
+        descriptor.redPrimary = CGPointMake(0.6797, 0.3203);
+        descriptor.terminationHandler = nil;
+        display = [[CGVirtualDisplay alloc] initWithDescriptor:descriptor];
+    } @catch (NSException *exception) {
+        NSLog(@"Owned virtual display create exception: %@", exception.reason ?: @"unknown");
+    }
+    if (display == nil) {
+        if (descriptor != nil) [descriptor release];
+        return nil;
+    }
+    *descriptorOut = descriptor;
+    *serialOut = serial;
+    return display;
+}
+
+bool IsValidOwnedVirtualDisplaySize(uint32_t width, uint32_t height) {
+    return width >= kOwnedVirtualDisplayMinDimension && height >= kOwnedVirtualDisplayMinDimension &&
+           width <= kOwnedVirtualDisplayMaxDimension && height <= kOwnedVirtualDisplayMaxDimension &&
+           width % kOwnedVirtualDisplayAlignment == 0 && height % kOwnedVirtualDisplayAlignment == 0 &&
+           static_cast<uint64_t>(width) * static_cast<uint64_t>(height) <= kOwnedVirtualDisplayMaxPixels;
+}
+
+void ClearOwnedVirtualDisplayState() {
+    if (g_ownedVirtualDisplay.reconfigurationCallbackRegistered) {
+        CGDisplayRemoveReconfigurationCallback(OwnedVirtualDisplayReconfigurationCallback, nullptr);
+    }
+    CGVirtualDisplay *display = g_ownedVirtualDisplay.display;
+    CGVirtualDisplayDescriptor *descriptor = g_ownedVirtualDisplay.descriptor;
+    CGVirtualDisplaySettings *settings = g_ownedVirtualDisplay.settings;
+    g_ownedVirtualDisplay = OwnedVirtualDisplayState{};
+    if (display != nil) [display release];
+    if (settings != nil) [settings release];
+    if (descriptor != nil) [descriptor release];
+}
+
+bool WaitForOwnedVirtualDisplayRaster(uint32_t width,
+                                      uint32_t height,
+                                      CGDirectDisplayID *displayIDOut,
+                                      uint32_t *pixelWidthOut,
+                                      uint32_t *pixelHeightOut,
+                                      int32_t *failureStatusOut) {
+    auto deadline = std::chrono::steady_clock::now() + kOwnedVirtualDisplayStabilityTimeout;
+    CGDirectDisplayID previousID = 0;
+    uint32_t previousWidth = 0;
+    uint32_t previousHeight = 0;
+    size_t stableSamples = 0;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (!OwnedVirtualDisplayTopologyIsSafe(false)) {
+            if (failureStatusOut != nullptr) *failureStatusOut = kOwnedVirtualDisplayUnsafeTopology;
+            return false;
+        }
+        CGDirectDisplayID displayID = FindOwnedVirtualDisplayID();
+        if (displayID != 0) {
+            uint32_t pixelWidth = static_cast<uint32_t>(CGDisplayPixelsWide(displayID));
+            uint32_t pixelHeight = static_cast<uint32_t>(CGDisplayPixelsHigh(displayID));
+            CGRect bounds = CGDisplayBounds(displayID);
+            bool targetMatches = pixelWidth == width && pixelHeight == height &&
+                std::fabs(bounds.size.width - static_cast<double>(width)) < 0.5 &&
+                std::fabs(bounds.size.height - static_cast<double>(height)) < 0.5;
+            if (targetMatches && displayID == previousID &&
+                pixelWidth == previousWidth && pixelHeight == previousHeight) {
+                ++stableSamples;
+            } else {
+                stableSamples = targetMatches ? 1 : 0;
+            }
+            previousID = displayID;
+            previousWidth = pixelWidth;
+            previousHeight = pixelHeight;
+            if (stableSamples >= 3) {
+                if (displayIDOut != nullptr) *displayIDOut = displayID;
+                if (pixelWidthOut != nullptr) *pixelWidthOut = pixelWidth;
+                if (pixelHeightOut != nullptr) *pixelHeightOut = pixelHeight;
+                return true;
+            }
+        } else {
+            previousID = 0;
+            previousWidth = 0;
+            previousHeight = 0;
+            stableSamples = 0;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    if (failureStatusOut != nullptr) *failureStatusOut = kOwnedVirtualDisplayStabilityTimeoutStatus;
+    return false;
+}
+
+bool WaitForOwnedVirtualDisplayRemoval(uint32_t serial) {
+    auto deadline = std::chrono::steady_clock::now() + kOwnedVirtualDisplayReleaseTimeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        std::vector<CGDirectDisplayID> ids;
+        if (GetOnlineDisplayIDs(&ids)) {
+            bool stillOnline = false;
+            for (CGDirectDisplayID displayID : ids) {
+                if (CGDisplayVendorNumber(displayID) == kOwnedVirtualDisplayVendorID &&
+                    CGDisplayModelNumber(displayID) == kOwnedVirtualDisplayProductID &&
+                    CGDisplaySerialNumber(displayID) == serial) {
+                    stillOnline = true;
+                    break;
+                }
+            }
+            if (!stillOnline) return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    return false;
+}
+
+int32_t ApplyOwnedVirtualDisplaySettings(uint32_t width,
+                                         uint32_t height,
+                                         CGVirtualDisplaySettings **settingsOut) {
+    if (settingsOut == nullptr) return kOwnedVirtualDisplayInvalidArgument;
+    *settingsOut = nil;
+    CGVirtualDisplaySettings *settings = CreateOwnedVirtualDisplaySettings(width, height);
+    if (settings == nil) return kOwnedVirtualDisplayApplyFailed;
+    @try {
+        if (![g_ownedVirtualDisplay.display applySettings:settings]) {
+            [settings release];
+            return kOwnedVirtualDisplayApplyFailed;
+        }
+        *settingsOut = settings;
+        return kOwnedVirtualDisplayOk;
+    } @catch (NSException *exception) {
+        NSLog(@"Owned virtual display settings exception: %@", exception.reason ?: @"unknown");
+        [settings release];
+        return kOwnedVirtualDisplayApplyFailed;
+    }
+}
+
+bool ReapplyOwnedVirtualDisplaySettings(CGVirtualDisplaySettings *settings) {
+    if (settings == nil || g_ownedVirtualDisplay.display == nil) return false;
+    @try {
+        return [g_ownedVirtualDisplay.display applySettings:settings];
+    } @catch (NSException *exception) {
+        NSLog(@"Owned virtual display rollback exception: %@", exception.reason ?: @"unknown");
+        return false;
+    }
+}
+}  // namespace
+
+// Capability probing has no display-creation or display-reconfiguration side effect.
+// Status: 0 ready, 1 invalid argument, 2 runtime unavailable, 3 unsafe topology.
+extern "C" int32_t MacOwnedVirtualDisplayGetCapabilities(uint32_t *maxWidth,
+                                                         uint32_t *maxHeight,
+                                                         uint32_t *widthAlignment,
+                                                         uint32_t *heightAlignment,
+                                                         uint64_t *maxPixels) {
+    if (maxWidth == nullptr || maxHeight == nullptr || widthAlignment == nullptr ||
+        heightAlignment == nullptr || maxPixels == nullptr) {
+        return kOwnedVirtualDisplayInvalidArgument;
+    }
+    *maxWidth = 0;
+    *maxHeight = 0;
+    *widthAlignment = 0;
+    *heightAlignment = 0;
+    *maxPixels = 0;
+    @autoreleasepool {
+        std::lock_guard<std::mutex> lock(g_ownedVirtualDisplayMutex);
+        if (!OwnedVirtualDisplayRuntimeAvailable()) return kOwnedVirtualDisplayRuntimeUnavailable;
+        *maxWidth = kOwnedVirtualDisplayMaxDimension;
+        *maxHeight = kOwnedVirtualDisplayMaxDimension;
+        *widthAlignment = kOwnedVirtualDisplayAlignment;
+        *heightAlignment = kOwnedVirtualDisplayAlignment;
+        *maxPixels = kOwnedVirtualDisplayMaxPixels;
+        if (!OwnedVirtualDisplayTopologyIsSafe(g_ownedVirtualDisplay.display != nil)) {
+            return kOwnedVirtualDisplayUnsafeTopology;
+        }
+        return kOwnedVirtualDisplayOk;
+    }
+}
+
+// Apply is synchronous but bounded to eight seconds for CG raster stabilization.
+// Callers must run it on a blocking worker, never on the connection receive loop.
+extern "C" int32_t MacOwnedVirtualDisplayApply(uint64_t ownerToken,
+                                               uint64_t generation,
+                                               uint32_t width,
+                                               uint32_t height,
+                                               uint32_t *displayIDOut,
+                                               uint32_t *pixelWidthOut,
+                                               uint32_t *pixelHeightOut) {
+    if (displayIDOut == nullptr || pixelWidthOut == nullptr || pixelHeightOut == nullptr) {
+        return kOwnedVirtualDisplayInvalidArgument;
+    }
+    *displayIDOut = 0;
+    *pixelWidthOut = 0;
+    *pixelHeightOut = 0;
+    if (ownerToken == 0 || generation == 0 || !IsValidOwnedVirtualDisplaySize(width, height)) {
+        return kOwnedVirtualDisplayInvalidArgument;
+    }
+
+    @autoreleasepool {
+        std::lock_guard<std::mutex> lock(g_ownedVirtualDisplayMutex);
+        if (!OwnedVirtualDisplayRuntimeAvailable()) return kOwnedVirtualDisplayRuntimeUnavailable;
+        bool hadOwnedDisplay = g_ownedVirtualDisplay.display != nil;
+        if (hadOwnedDisplay && ownerToken != g_ownedVirtualDisplay.ownerToken) {
+            return kOwnedVirtualDisplayBusyOwner;
+        }
+        if (hadOwnedDisplay && generation < g_ownedVirtualDisplay.generation) {
+            return kOwnedVirtualDisplayStaleGeneration;
+        }
+        if (!OwnedVirtualDisplayTopologyIsSafe(hadOwnedDisplay)) {
+            return kOwnedVirtualDisplayUnsafeTopology;
+        }
+        if (hadOwnedDisplay && generation == g_ownedVirtualDisplay.generation &&
+            (width != g_ownedVirtualDisplay.width || height != g_ownedVirtualDisplay.height)) {
+            return kOwnedVirtualDisplayStaleGeneration;
+        }
+
+        OwnedVirtualDisplaySpaceSnapshot spaceSnapshot = CaptureCurrentOwnedDisplaySpace();
+        uint32_t oldWidth = hadOwnedDisplay ? g_ownedVirtualDisplay.width : 0;
+        uint32_t oldHeight = hadOwnedDisplay ? g_ownedVirtualDisplay.height : 0;
+        uint64_t eventSerialAtStart = g_ownedVirtualDisplayReconfigurationEvents.load(std::memory_order_relaxed);
+        if (!hadOwnedDisplay) {
+            if (CGDisplayRegisterReconfigurationCallback(OwnedVirtualDisplayReconfigurationCallback,
+                                                         nullptr) != kCGErrorSuccess) {
+                return kOwnedVirtualDisplayApplyFailed;
+            }
+            g_ownedVirtualDisplay.reconfigurationCallbackRegistered = true;
+            CGVirtualDisplayDescriptor *descriptor = nil;
+            uint32_t serial = 0;
+            CGVirtualDisplay *display = CreateOwnedVirtualDisplay(&descriptor, width, height, &serial);
+            if (display == nil || descriptor == nil || serial == 0) {
+                if (display != nil) [display release];
+                if (descriptor != nil) [descriptor release];
+                ClearOwnedVirtualDisplayState();
+                return kOwnedVirtualDisplayCreateFailed;
+            }
+            g_ownedVirtualDisplay.display = display;
+            g_ownedVirtualDisplay.descriptor = descriptor;
+            g_ownedVirtualDisplay.ownerToken = ownerToken;
+            g_ownedVirtualDisplay.displayID = display.displayID;
+            g_ownedVirtualDisplay.serial = serial;
+        }
+
+        if (hadOwnedDisplay && generation == g_ownedVirtualDisplay.generation) {
+            CGDirectDisplayID displayID = 0;
+            uint32_t actualWidth = 0;
+            uint32_t actualHeight = 0;
+            int32_t failureStatus = kOwnedVirtualDisplayStabilityTimeoutStatus;
+            if (!WaitForOwnedVirtualDisplayRaster(width, height, &displayID,
+                                                   &actualWidth, &actualHeight,
+                                                   &failureStatus)) {
+                return failureStatus;
+            }
+            *displayIDOut = displayID;
+            *pixelWidthOut = actualWidth;
+            *pixelHeightOut = actualHeight;
+            return kOwnedVirtualDisplayOk;
+        }
+
+        CGVirtualDisplaySettings *newSettings = nil;
+        int32_t applyStatus = ApplyOwnedVirtualDisplaySettings(width, height, &newSettings);
+        if (applyStatus != kOwnedVirtualDisplayOk) {
+            if (!hadOwnedDisplay) {
+                uint32_t serial = g_ownedVirtualDisplay.serial;
+                ClearOwnedVirtualDisplayState();
+                bool removed = WaitForOwnedVirtualDisplayRemoval(serial);
+                return removed ? kOwnedVirtualDisplayApplyFailed : kOwnedVirtualDisplayRestoreFailed;
+            }
+            bool restored = oldWidth != 0 && oldHeight != 0 &&
+                ReapplyOwnedVirtualDisplaySettings(g_ownedVirtualDisplay.settings);
+            CGDirectDisplayID restoreID = 0;
+            uint32_t restoreWidth = 0;
+            uint32_t restoreHeight = 0;
+            int32_t restoreFailure = kOwnedVirtualDisplayStabilityTimeoutStatus;
+            restored = restored && WaitForOwnedVirtualDisplayRaster(oldWidth, oldHeight,
+                &restoreID, &restoreWidth, &restoreHeight, &restoreFailure);
+            if (restored) {
+                g_ownedVirtualDisplay.displayID = restoreID;
+                return kOwnedVirtualDisplayApplyFailed;
+            }
+            uint32_t serial = g_ownedVirtualDisplay.serial;
+            ClearOwnedVirtualDisplayState();
+            WaitForOwnedVirtualDisplayRemoval(serial);
+            return kOwnedVirtualDisplayRestoreFailed;
+        }
+
+        CGDirectDisplayID actualDisplayID = 0;
+        uint32_t actualWidth = 0;
+        uint32_t actualHeight = 0;
+        int32_t failureStatus = kOwnedVirtualDisplayStabilityTimeoutStatus;
+        if (!WaitForOwnedVirtualDisplayRaster(width, height, &actualDisplayID,
+                                               &actualWidth, &actualHeight,
+                                               &failureStatus)) {
+            if (hadOwnedDisplay) {
+                bool restored = oldWidth != 0 && oldHeight != 0 &&
+                    ReapplyOwnedVirtualDisplaySettings(g_ownedVirtualDisplay.settings);
+                CGDirectDisplayID restoreID = 0;
+                uint32_t restoreWidth = 0;
+                uint32_t restoreHeight = 0;
+                int32_t restoreFailure = kOwnedVirtualDisplayStabilityTimeoutStatus;
+                restored = restored && WaitForOwnedVirtualDisplayRaster(oldWidth, oldHeight,
+                    &restoreID, &restoreWidth, &restoreHeight, &restoreFailure);
+                if (restored) {
+                    if (newSettings != nil) [newSettings release];
+                    g_ownedVirtualDisplay.displayID = restoreID;
+                    return failureStatus;
+                }
+            }
+            if (newSettings != nil) [newSettings release];
+            uint32_t serial = g_ownedVirtualDisplay.serial;
+            ClearOwnedVirtualDisplayState();
+            bool removed = WaitForOwnedVirtualDisplayRemoval(serial);
+            if (!removed) return kOwnedVirtualDisplayRestoreFailed;
+            return failureStatus;
+        }
+
+        CGVirtualDisplaySettings *oldSettings = g_ownedVirtualDisplay.settings;
+        g_ownedVirtualDisplay.settings = newSettings;
+        newSettings = nil;
+        if (oldSettings != nil) [oldSettings release];
+        g_ownedVirtualDisplay.ownerToken = ownerToken;
+        g_ownedVirtualDisplay.generation = generation;
+        g_ownedVirtualDisplay.displayID = actualDisplayID;
+        g_ownedVirtualDisplay.width = width;
+        g_ownedVirtualDisplay.height = height;
+        *displayIDOut = actualDisplayID;
+        *pixelWidthOut = actualWidth;
+        *pixelHeightOut = actualHeight;
+        uint64_t eventsSeen = g_ownedVirtualDisplayReconfigurationEvents.load(std::memory_order_relaxed) -
+                              eventSerialAtStart;
+        NSLog(@"Owned virtual display applied: id=%u size=%ux%u generation=%llu reconfigurationEvents=%llu",
+              actualDisplayID, actualWidth, actualHeight,
+              static_cast<unsigned long long>(generation),
+              static_cast<unsigned long long>(eventsSeen));
+        if (spaceSnapshot.valid && !RestoreOwnedDisplaySpace(spaceSnapshot)) {
+            NSLog(@"Owned virtual display could not restore the captured current Space");
+        }
+        // Do not activate or restore an application here. On macOS an app's
+        // frontmost state is global to the login session, not scoped to the
+        // desktop currently visible to the user. Re-activating a captured
+        // process can therefore pull the user into a different full-screen
+        // Space (for example, the Windows App Space) after a 2x resize.
+        // Leaving activation untouched preserves the Space the user was in.
+        return kOwnedVirtualDisplayOk;
+    }
+}
+
+// Release is idempotent after cleanup and never changes another display's mode or topology.
+extern "C" int32_t MacOwnedVirtualDisplayRelease(uint64_t ownerToken, uint64_t generation) {
+    if (ownerToken == 0 || generation == 0) return kOwnedVirtualDisplayInvalidArgument;
+    @autoreleasepool {
+        std::lock_guard<std::mutex> lock(g_ownedVirtualDisplayMutex);
+        if (g_ownedVirtualDisplay.display == nil) return kOwnedVirtualDisplayOk;
+        if (ownerToken != g_ownedVirtualDisplay.ownerToken) return kOwnedVirtualDisplayBusyOwner;
+        if (generation != g_ownedVirtualDisplay.generation) return kOwnedVirtualDisplayStaleGeneration;
+        OwnedVirtualDisplaySpaceSnapshot spaceSnapshot = CaptureCurrentOwnedDisplaySpace();
+        uint32_t serial = g_ownedVirtualDisplay.serial;
+        uint32_t displayID = g_ownedVirtualDisplay.displayID;
+        ClearOwnedVirtualDisplayState();
+        bool removed = WaitForOwnedVirtualDisplayRemoval(serial);
+        NSLog(@"Owned virtual display released: id=%u removed=%d", displayID, removed ? 1 : 0);
+        if (removed && spaceSnapshot.valid && !RestoreOwnedDisplaySpace(spaceSnapshot)) {
+            NSLog(@"Owned virtual display could not restore the current Space after release");
+        }
+        return removed ? kOwnedVirtualDisplayOk : kOwnedVirtualDisplayRestoreFailed;
+    }
 }
 
 static CFMachPortRef g_eventTap = NULL;

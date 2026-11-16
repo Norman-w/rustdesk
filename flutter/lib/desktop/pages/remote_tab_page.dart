@@ -49,6 +49,7 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
   String? peerId;
   bool _isScreenRectSet = false;
   int? _display;
+  bool _windowHideInProgress = false;
 
   var connectionMap = RxList<Widget>.empty(growable: true);
 
@@ -106,7 +107,9 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
       ));
       _update_remote_count();
     }
-    tabController.onRemoved = (_, id) => onRemoveId(id);
+    tabController.onRemoved = (_, id) {
+      unawaited(onRemoveId(id));
+    };
     rustDeskWinManager.setMethodHandler(_remoteMethodHandler);
   }
 
@@ -358,26 +361,44 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
     );
   }
 
-  void onRemoveId(String id) async {
+  Future<void> onRemoveId(String id) async {
     if (tabController.state.value.tabs.isEmpty) {
-      // Keep calling until the window status is hidden.
-      //
-      // Workaround for Windows:
-      // If you click other buttons and close in msgbox within a very short period of time, the close may fail.
-      // `await WindowController.fromWindowId(windowId()).close();`.
-      Future<void> loopCloseWindow() async {
-        int c = 0;
-        final windowController = WindowController.fromWindowId(windowId());
-        while (c < 20 &&
-            tabController.state.value.tabs.isEmpty &&
-            (!await windowController.isHidden())) {
-          await windowController.close();
-          await Future.delayed(Duration(milliseconds: 100));
-          c++;
+      if (!_windowHideInProgress) {
+        _windowHideInProgress = true;
+        try {
+          // Let a newly-added tab win if reconnect handling runs in the same
+          // event turn as the close callback.
+          await Future<void>.delayed(Duration.zero);
+          if (tabController.state.value.tabs.isEmpty) {
+            final windowController = WindowController.fromWindowId(windowId());
+            if (isMacOS) {
+              // Keep the Flutter engine alive. Closing it while RemotePage's
+              // async dispose is still releasing textures can produce a black
+              // flash, a second close animation, and a lost input channel.
+              await windowController.hide();
+              await rustDeskWinManager.call(
+                WindowType.Main,
+                kWindowEventHide,
+                {"id": windowId()},
+              );
+            } else {
+              // Keep calling until the window status is hidden.
+              // Workaround for Windows, where a close can fail if a dialog
+              // was just dismissed in the same event turn.
+              int c = 0;
+              while (c < 20 &&
+                  tabController.state.value.tabs.isEmpty &&
+                  (!await windowController.isHidden())) {
+                await windowController.close();
+                await Future.delayed(Duration(milliseconds: 100));
+                c++;
+              }
+            }
+          }
+        } finally {
+          _windowHideInProgress = false;
         }
       }
-
-      loopCloseWindow();
     }
     ConnectionTypeState.delete(id);
     // Clean up relative mouse mode state for this peer.

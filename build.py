@@ -320,7 +320,10 @@ def get_features(args):
         features.append('vram')
     if args.flutter:
         features.append('flutter')
-    if args.unix_file_copy_paste:
+    # macOS uses the native NSPasteboard implementation for file clipboard
+    # support. Ship it in every macOS build so a Mac controller can copy a
+    # file once and paste it repeatedly on a remote Mac.
+    if args.unix_file_copy_paste or osx:
         features.append('unix-file-copy-paste')
     if args.drm:
         # Say so rather than quietly handing back a stock build: the backend is Linux-only, so on
@@ -906,7 +909,12 @@ def build_flutter_dmg(version, features):
     mac_arch = 'arm64' if platform.machine().lower() in ('arm64', 'aarch64') else 'x86_64'
     system2(
         f'FLUTTER_XCODE_ARCHS={mac_arch} FLUTTER_XCODE_ONLY_ACTIVE_ARCH=YES flutter build macos --release')
-    system2('cp -rf ../target/release/service ./build/macos/Build/Products/Release/RustDesk.app/Contents/MacOS/')
+    system2(
+        'cp -rf ../target/release/service ./build/macos/Build/Products/Release/NormanRemoteDesktop.app/Contents/MacOS/')
+    # Flutter signs the bundle before the Rust service is copied in; reseal the
+    # finished app so macOS accepts the final bundle and its TCC identity.
+    system2(
+        'codesign --deep --force --sign - ./build/macos/Build/Products/Release/NormanRemoteDesktop.app')
     '''
     system2(
         "create-dmg --volname \"RustDesk Installer\" --window-pos 200 120 --window-size 800 400 --icon-size 100 --app-drop-link 600 185 --icon RustDesk.app 200 190 --hide-extension RustDesk.app rustdesk.dmg ./build/macos/Build/Products/Release/RustDesk.app")

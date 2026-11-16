@@ -72,6 +72,9 @@ mod connection;
 mod login_failure_check;
 pub(crate) mod port_forward_mux;
 pub mod display_service;
+pub mod owned_virtual_display;
+#[cfg(target_os = "macos")]
+mod owned_virtual_display_runtime;
 #[cfg(windows)]
 pub mod portable_service;
 mod service;
@@ -406,6 +409,10 @@ impl Server {
                 continue;
             }
             if !noperms.contains(&(&name as _)) {
+                #[cfg(target_os = "macos")]
+                if name == audio_service::NAME {
+                    audio_service::set_remote_audio_subscription(true);
+                }
                 s.on_subscribe(conn.clone());
             }
         }
@@ -416,7 +423,14 @@ impl Server {
 
     pub fn remove_connection(&mut self, conn: &ConnInner) {
         for s in self.services.values() {
+            #[cfg(target_os = "macos")]
+            let was_audio_subscribed =
+                s.name() == audio_service::NAME && s.is_subed(conn.id());
             s.on_unsubscribe(conn.id());
+            #[cfg(target_os = "macos")]
+            if was_audio_subscribed {
+                audio_service::set_remote_audio_subscription(false);
+            }
         }
         self.connections.remove(&conn.id());
         #[cfg(target_os = "macos")]
@@ -449,9 +463,17 @@ impl Server {
                 return;
             }
             if sub {
+                #[cfg(target_os = "macos")]
+                if name == audio_service::NAME {
+                    audio_service::set_remote_audio_subscription(true);
+                }
                 s.on_subscribe(conn.clone());
             } else {
                 s.on_unsubscribe(conn.id());
+                #[cfg(target_os = "macos")]
+                if name == audio_service::NAME {
+                    audio_service::set_remote_audio_subscription(false);
+                }
             }
             #[cfg(target_os = "macos")]
             self.update_enable_retina();

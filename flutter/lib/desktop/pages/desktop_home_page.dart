@@ -47,6 +47,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
   var watchIsProcessTrust = false;
   var watchIsInputMonitoring = false;
   var watchIsCanRecordAudio = false;
+  var macTccRelaunchRequested = false;
   Timer? _updateTimer;
   bool isCardClosed = false;
 
@@ -427,6 +428,26 @@ class _DesktopHomePageState extends State<DesktopHomePage>
     );
   }
 
+  bool _macTccReady() {
+    return bind.mainIsCanScreenRecording(prompt: false) &&
+        bind.mainIsProcessTrusted(prompt: false) &&
+        bind.mainIsCanInputMonitoring(prompt: false);
+  }
+
+  void _recoverMacServiceIfTccReady({bool relaunch = false}) {
+    if (isMacOS && !bind.isOutgoingOnly() && _macTccReady()) {
+      bind.mainStartService();
+      if (relaunch && !macTccRelaunchRequested) {
+        macTccRelaunchRequested = true;
+        bind.mainRelaunchApp();
+      }
+    }
+  }
+
+  void _requestMacTccRepair() {
+    DesktopSettingPage.switch2page(SettingsTabKey.normanGuide);
+  }
+
   Widget buildHelpCards(String updateUrl) {
     if (!bind.isCustomClient() &&
         updateUrl.isNotEmpty &&
@@ -476,7 +497,14 @@ class _DesktopHomePageState extends State<DesktopHomePage>
       }
     } else if (isMacOS) {
       final isOutgoingOnly = bind.isOutgoingOnly();
-      if (!(isOutgoingOnly || bind.mainIsCanScreenRecording(prompt: false))) {
+      if (!isOutgoingOnly &&
+          (!_macTccReady() || !bind.mainIsNormanCmHelperInstalled())) {
+        return buildInstallCard(
+            "macos_setup_guide_title", "macos_setup_guide_summary",
+            "macos_setup_guide_open", () {
+          DesktopSettingPage.switch2page(SettingsTabKey.normanGuide);
+        });
+      } else if (!(isOutgoingOnly || bind.mainIsCanScreenRecording(prompt: false))) {
         return buildInstallCard("Permissions", "config_screen", "Configure",
             () async {
           bind.mainIsCanScreenRecording(prompt: true);
@@ -710,22 +738,21 @@ class _DesktopHomePageState extends State<DesktopHomePage>
       if (watchIsCanScreenRecording) {
         if (bind.mainIsCanScreenRecording(prompt: false)) {
           watchIsCanScreenRecording = false;
+          _recoverMacServiceIfTccReady(relaunch: true);
           setState(() {});
         }
       }
       if (watchIsProcessTrust) {
         if (bind.mainIsProcessTrusted(prompt: false)) {
           watchIsProcessTrust = false;
+          _recoverMacServiceIfTccReady(relaunch: true);
           setState(() {});
         }
       }
       if (watchIsInputMonitoring) {
         if (bind.mainIsCanInputMonitoring(prompt: false)) {
           watchIsInputMonitoring = false;
-          // Do not notify for now.
-          // Monitoring may not take effect until the process is restarted.
-          // rustDeskWinManager.call(
-          //     WindowType.RemoteDesktop, kWindowDisableGrabKeyboard, '');
+          _recoverMacServiceIfTccReady(relaunch: true);
           setState(() {});
         }
       }

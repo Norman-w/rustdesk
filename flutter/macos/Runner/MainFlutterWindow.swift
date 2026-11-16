@@ -90,11 +90,6 @@ class MainFlutterWindow: NSWindow {
         super.awakeFromNib()
     }
 
-    override public func order(_ place: NSWindow.OrderingMode, relativeTo otherWin: Int) {
-        super.order(place, relativeTo: otherWin)
-        hiddenWindowAtLaunch()
-    }
-
     /// Override window theme.
     public func setWindowInterfaceMode(window: NSWindow, themeName: String) {
         window.appearance = NSAppearance(named: themeName == "light" ? .aqua : .darkAqua)
@@ -214,7 +209,11 @@ class MainFlutterWindow: NSWindow {
                     result(nil)
                     break;
                 case "terminate":
-                    NSApplication.shared.terminate(self)
+                    if let appDelegate = NSApplication.shared.delegate as? AppDelegate {
+                        appDelegate.terminateForUserRequest()
+                    } else {
+                        NSApplication.shared.terminate(self)
+                    }
                     result(nil)
                 case "canRecordAudio":
                     switch AVCaptureDevice.authorizationStatus(for: .audio) {

@@ -18,7 +18,8 @@ use crate::platform::WallPaperRemover;
 use crate::portable_service::client as portable_client;
 use crate::{
     client::{
-        new_voice_call_request, new_voice_call_response, start_audio_thread, MediaData, MediaSender,
+        configured_remote_mic_output_device, new_voice_call_request, new_voice_call_response,
+        start_audio_thread_with_output_device, MediaData, MediaSender,
     },
     display_service, ipc, privacy_mode, video_service, VERSION,
 };
@@ -136,6 +137,8 @@ pub struct ConnInner {
     id: i32,
     tx: Option<Sender>,
     tx_video: Option<Sender>,
+    #[cfg(target_os = "macos")]
+    display_sizes: Arc<Mutex<std::collections::HashMap<i32, (u32, u32)>>>,
 }
 
 struct InputMouse {
@@ -315,6 +318,8 @@ pub struct Connection {
     from_switch: bool,
     voice_call_request_timestamp: Option<NonZeroI64>,
     voice_calling: bool,
+    #[cfg(target_os = "macos")]
+    remote_mic_route_active: bool,
     options_in_login: Option<OptionMessage>,
     #[cfg(not(any(target_os = "ios")))]
     pressed_modifiers: HashSet<rdev::Key>,
@@ -358,7 +363,62 @@ pub struct Connection {
 
 impl ConnInner {
     pub fn new(id: i32, tx: Option<Sender>, tx_video: Option<Sender>) -> Self {
-        Self { id, tx, tx_video }
+        Self {
+            id,
+            tx,
+            tx_video,
+            #[cfg(target_os = "macos")]
+            display_sizes: Arc::default(),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn send_owned_display_result(&self, result: OwnedVirtualDisplayResult) {
+        let mut misc = Misc::new();
+        misc.set_owned_virtual_display_result(result);
+        let mut message = Message::new();
+        message.set_misc(misc);
+        if let Some(tx) = &self.tx_video {
+            let _ = tx.send((Instant::now(), Arc::new(message)));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn update_display_sizes(&self, message: &Message) {
+        let Some(union) = message.union.as_ref() else {
+            return;
+        };
+        let Ok(mut sizes) = self.display_sizes.lock() else {
+            return;
+        };
+        match union {
+            message::Union::PeerInfo(peer_info) => {
+                // PeerInfo is the complete display snapshot sent to a newly
+                // subscribed connection. Replace the map so removed/reordered
+                // indices cannot leave stale dimensions behind.
+                sizes.clear();
+                for (index, display) in peer_info.displays.iter().enumerate() {
+                    if let (Ok(width), Ok(height)) =
+                        (u32::try_from(display.width), u32::try_from(display.height))
+                    {
+                        if width > 0 && height > 0 {
+                            sizes.insert(index as i32, (width, height));
+                        }
+                    }
+                }
+            }
+            message::Union::Misc(misc) => {
+                if let Some(misc::Union::SwitchDisplay(display)) = misc.union.as_ref() {
+                    if display.display >= 0 && display.width > 0 && display.height > 0 {
+                        sizes.insert(
+                            display.display,
+                            (display.width as u32, display.height as u32),
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -370,23 +430,26 @@ impl Subscriber for ConnInner {
 
     #[inline]
     fn send(&mut self, msg: Arc<Message>) {
+        #[cfg(target_os = "macos")]
+        self.update_display_sizes(msg.as_ref());
         // Send SwitchDisplay on the same channel as VideoFrame to avoid send order problems.
         let tx_by_video = match &msg.union {
             Some(message::Union::VideoFrame(_)) => true,
             Some(message::Union::Misc(misc)) => match &misc.union {
                 Some(misc::Union::SwitchDisplay(_)) => true,
+                Some(misc::Union::OwnedVirtualDisplayResult(_)) => true,
                 _ => false,
             },
             _ => false,
         };
         let tx = if tx_by_video {
-            self.tx_video.as_mut()
+            self.tx_video.as_ref()
         } else {
-            self.tx.as_mut()
+            self.tx.as_ref()
         };
-        tx.map(|tx| {
-            allow_err!(tx.send((Instant::now(), msg)));
-        });
+        if let Some(tx) = tx {
+            let _ = tx.send((Instant::now(), msg));
+        }
     }
 }
 
@@ -457,6 +520,8 @@ impl Connection {
                 id,
                 tx: Some(tx),
                 tx_video: Some(tx_video),
+                #[cfg(target_os = "macos")]
+                display_sizes: Arc::default(),
             },
             require_2fa: crate::auth_2fa::get_2fa(None),
             awaiting_2fa: false,
@@ -519,6 +584,8 @@ impl Connection {
             audio_sender: None,
             voice_call_request_timestamp: None,
             voice_calling: false,
+            #[cfg(target_os = "macos")]
+            remote_mic_route_active: false,
             options_in_login: None,
             #[cfg(not(any(target_os = "ios")))]
             pressed_modifiers: Default::default(),
@@ -709,12 +776,12 @@ impl Connection {
                                             if conn.voice_calling || !conn.audio_enabled() {
                                                 s.write().unwrap().subscribe(
                                                     super::audio_service::NAME,
-                                                    conn.inner.clone(), conn.audio_enabled());
+                                                    conn.inner.clone(), conn.audio_subscription_enabled());
                                             }
                                         } else {
                                             s.write().unwrap().subscribe(
                                                 super::audio_service::NAME,
-                                                conn.inner.clone(), conn.audio_enabled());
+                                                conn.inner.clone(), conn.audio_subscription_enabled());
                                         }
                                     }
                                 }
@@ -2016,6 +2083,13 @@ impl Connection {
                         })
                         .into();
                     }
+                    #[cfg(target_os = "macos")]
+                    {
+                        pi.owned_virtual_display = Some(
+                            super::owned_virtual_display_runtime::capabilities(self.keyboard),
+                        )
+                        .into();
+                    }
                     res.set_peer_info(pi);
                     sub_service = true;
 
@@ -2192,6 +2266,27 @@ impl Connection {
 
     fn audio_enabled(&self) -> bool {
         self.audio && !self.disable_audio
+    }
+
+    /// On macOS, ordinary audio subscription uses ScreenCaptureKit's system
+    /// audio loopback. The phone microphone remains a separate voice-call
+    /// stream routed to the Norman virtual microphone output device.
+    fn audio_subscription_enabled(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            #[cfg(feature = "screencapturekit")]
+            {
+                self.audio_enabled()
+            }
+            #[cfg(not(feature = "screencapturekit"))]
+            {
+                false
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.audio_enabled() && !self.voice_calling
+        }
     }
 
     #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
@@ -3690,6 +3785,9 @@ impl Connection {
                     _ => {}
                 },
                 Some(message::Union::Misc(misc)) => match misc.union {
+                    Some(misc::Union::OwnedVirtualDisplayRequest(request)) => {
+                        self.handle_owned_virtual_display_request(request);
+                    }
                     Some(misc::Union::SwitchDisplay(s)) => {
                         self.handle_switch_display(s).await;
                     }
@@ -3775,10 +3873,29 @@ impl Connection {
                         _ => {}
                     },
                     Some(misc::Union::AudioFormat(format)) => {
-                        if !self.disable_audio {
+                        // Voice-call audio is the controller's microphone stream.
+                        // It must still be decoded when ordinary remote audio is
+                        // disabled; that preference protects the controlled Mac
+                        // microphone from being opened and sent upstream.
+                        if !self.disable_audio || self.voice_calling {
                             // Drop the audio sender previously.
                             drop(std::mem::replace(&mut self.audio_sender, None));
-                            self.audio_sender = Some(start_audio_thread());
+                            // A voice call carries the remote microphone. Keep ordinary
+                            // remote system audio on the normal speaker, but allow an
+                            // explicitly configured virtual output device for voice input.
+                            let output_device_name = if self.voice_calling {
+                                configured_remote_mic_output_device()
+                            } else {
+                                None
+                            };
+                            if let Some(name) = output_device_name.as_deref() {
+                                log::info!(
+                                    "Routing incoming voice-call audio to configured output device: \"{}\"",
+                                    name
+                                );
+                            }
+                            self.audio_sender =
+                                Some(start_audio_thread_with_output_device(output_device_name));
                             self.audio_sender
                                 .as_ref()
                                 .map(|a| allow_err!(a.send(MediaData::AudioFormat(format))));
@@ -3865,7 +3982,9 @@ impl Connection {
                     _ => {}
                 },
                 Some(message::Union::AudioFrame(frame)) => {
-                    if !self.disable_audio {
+                    // Voice-call frames are the one-way phone-to-Mac input path and
+                    // are intentionally independent from the Mac-audio preference.
+                    if !self.disable_audio || self.voice_calling {
                         if let Some(sender) = &self.audio_sender {
                             allow_err!(sender.send(MediaData::AudioFrame(Box::new(frame))));
                         } else {
@@ -3881,7 +4000,27 @@ impl Connection {
                             NonZeroI64::new(request.req_timestamp)
                                 .unwrap_or(NonZeroI64::new(get_time()).unwrap()),
                         );
-                        // Notify the connection manager.
+                        // A tray/headless server has no Flutter dialog that can
+                        // answer the incoming voice-call event. When the Norman
+                        // virtual-input route is explicitly configured, accept
+                        // it here so the phone does not wait for the 15s request
+                        // timeout. The configured Norman route is explicit opt-in
+                        // and does not open the controlled Mac's built-in microphone.
+                        #[cfg(target_os = "macos")]
+                        {
+                            // The normal App starts an internal --cm process rather
+                            // than exposing the legacy --server argument, so do not
+                            // gate this path on the process name.
+                            if configured_remote_mic_output_device().is_some() {
+                                log::info!(
+                                    "Auto-accepting incoming voice call for the configured Norman virtual input"
+                                );
+                                self.handle_voice_call(true).await;
+                            } else {
+                                self.send_to_cm(Data::VoiceCallIncoming);
+                            }
+                        }
+                        #[cfg(not(target_os = "macos"))]
                         self.send_to_cm(Data::VoiceCallIncoming);
                     } else {
                         self.close_voice_call().await;
@@ -4607,6 +4746,59 @@ impl Connection {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    fn handle_owned_virtual_display_request(&self, request: OwnedVirtualDisplayRequest) {
+        let inner = self.inner.clone();
+        let emit: super::owned_virtual_display_runtime::ResultEmitter =
+            Arc::new(move |result| inner.send_owned_display_result(result));
+        if !self.authorized || !self.is_remote() {
+            super::owned_virtual_display_runtime::reject(
+                &request,
+                &emit,
+                OwnedVirtualDisplayStatus::OWNED_DISPLAY_STATUS_UNSUPPORTED,
+                -10,
+                "owned display is limited to authenticated remote sessions",
+            );
+            return;
+        }
+        match request.operation.enum_value() {
+            Ok(OwnedVirtualDisplayOperation::OWNED_DISPLAY_OPERATION_APPLY)
+                if !self.keyboard =>
+            {
+                super::owned_virtual_display_runtime::reject(
+                    &request,
+                    &emit,
+                    OwnedVirtualDisplayStatus::OWNED_DISPLAY_STATUS_PERMISSION_DENIED,
+                    -11,
+                    "display control permission is disabled",
+                );
+            }
+            Ok(OwnedVirtualDisplayOperation::OWNED_DISPLAY_OPERATION_APPLY)
+            | Ok(OwnedVirtualDisplayOperation::OWNED_DISPLAY_OPERATION_RELEASE) => {
+                if !super::owned_virtual_display_runtime::submit(
+                    self.inner.id(),
+                    request.clone(),
+                    emit.clone(),
+                ) {
+                    super::owned_virtual_display_runtime::reject(
+                        &request,
+                        &emit,
+                        OwnedVirtualDisplayStatus::OWNED_DISPLAY_STATUS_FAILED,
+                        -12,
+                        "owned display worker is unavailable",
+                    );
+                }
+            }
+            _ => super::owned_virtual_display_runtime::reject(
+                &request,
+                &emit,
+                OwnedVirtualDisplayStatus::OWNED_DISPLAY_STATUS_UNSUPPORTED,
+                -13,
+                "unknown owned display operation",
+            ),
+        }
+    }
+
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn change_resolution(&mut self, d: Option<usize>, r: &Resolution) {
         if self.keyboard {
@@ -4661,26 +4853,64 @@ impl Connection {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    fn begin_remote_mic_route(&mut self) {
+        if self.remote_mic_route_active {
+            return;
+        }
+        let Some(device_name) = configured_remote_mic_output_device() else {
+            log::debug!("Remote microphone route is not configured");
+            return;
+        };
+        if crate::platform::begin_remote_mic_route(&device_name) {
+            self.remote_mic_route_active = true;
+            log::info!("Remote microphone route enabled for '{}'", device_name);
+        } else {
+            log::warn!(
+                "Remote microphone route could not select macOS input device '{}'",
+                device_name
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn end_remote_mic_route(&mut self) {
+        if !self.remote_mic_route_active {
+            return;
+        }
+        crate::platform::end_remote_mic_route();
+        self.remote_mic_route_active = false;
+        log::info!("Remote microphone route ended");
+    }
+
     pub async fn handle_voice_call(&mut self, accepted: bool) {
         if let Some(ts) = self.voice_call_request_timestamp.take() {
             let msg = new_voice_call_response(ts.get(), accepted);
             if accepted {
+                #[cfg(not(target_os = "macos"))]
                 crate::audio_service::set_voice_call_input_device(
                     crate::get_default_sound_input(),
                     false,
                 );
+                #[cfg(target_os = "macos")]
+                {
+                    self.begin_remote_mic_route();
+                    log::info!(
+                        "Voice call accepted as one-way remote microphone input; controlled microphone capture remains disabled"
+                    );
+                }
                 self.send_to_cm(Data::StartVoiceCall);
             } else {
                 self.send_to_cm(Data::CloseVoiceCall("".to_owned()));
             }
             self.send(msg).await;
             self.voice_calling = accepted;
-            if self.is_authed_view_camera_conn() {
+            if self.is_authed_view_camera_conn() || self.is_authed_remote_conn() {
                 if let Some(s) = self.server.upgrade() {
                     s.write().unwrap().subscribe(
                         super::audio_service::NAME,
                         self.inner.clone(),
-                        self.audio_enabled() && accepted,
+                        self.audio_subscription_enabled(),
                     );
                 }
             }
@@ -4690,15 +4920,22 @@ impl Connection {
     }
 
     pub async fn close_voice_call(&mut self) {
+        // Stop the CPAL output before restoring the user's normal input. Keeping
+        // the old stream alive made the next virtual-input call intermittent.
+        drop(std::mem::replace(&mut self.audio_sender, None));
+        #[cfg(target_os = "macos")]
+        self.end_remote_mic_route();
         crate::audio_service::set_voice_call_input_device(None, true);
         // Notify the connection manager that the voice call has been closed.
         self.send_to_cm(Data::CloseVoiceCall("".to_owned()));
         self.voice_calling = false;
-        if self.is_authed_view_camera_conn() {
+        if self.is_authed_view_camera_conn() || self.is_authed_remote_conn() {
             if let Some(s) = self.server.upgrade() {
-                s.write()
-                    .unwrap()
-                    .subscribe(super::audio_service::NAME, self.inner.clone(), false);
+                s.write().unwrap().subscribe(
+                    super::audio_service::NAME,
+                    self.inner.clone(),
+                    self.audio_subscription_enabled(),
+                );
             }
         }
     }
@@ -4782,14 +5019,14 @@ impl Connection {
                             s.write().unwrap().subscribe(
                                 super::audio_service::NAME,
                                 self.inner.clone(),
-                                self.audio_enabled(),
+                                self.audio_subscription_enabled(),
                             );
                         }
                     } else {
                         s.write().unwrap().subscribe(
                             super::audio_service::NAME,
                             self.inner.clone(),
-                            self.audio_enabled(),
+                            self.audio_subscription_enabled(),
                         );
                     }
                 }
@@ -5086,6 +5323,8 @@ impl Connection {
             return;
         }
         self.closed = true;
+        #[cfg(target_os = "macos")]
+        super::owned_virtual_display_runtime::disconnected(self.inner.id());
         // If voice A,B -> C, and A,B has voice call
         // B disconnects, C will reset the voice call input.
         //
@@ -5095,6 +5334,11 @@ impl Connection {
         //
         // We can add a (Vec<conn_id>, input device) to avoid this.
         // But it's not necessary now and we have to consider two audio services(client, server).
+        // Restore the system input if the peer disappears without sending an
+        // explicit voice-call close message.
+        drop(std::mem::replace(&mut self.audio_sender, None));
+        #[cfg(target_os = "macos")]
+        self.end_remote_mic_route();
         crate::audio_service::set_voice_call_input_device(None, true);
         log::info!("#{} Connection closed: {}", self.inner.id(), reason);
         if lock && self.lock_after_session_end && self.keyboard {
@@ -5956,6 +6200,12 @@ impl Connection {
     fn misc_message_family(misc: &Misc) -> &'static str {
         match misc.union.as_ref() {
             Some(misc::Union::ChatMessage(_)) => "misc.chat_message",
+            Some(misc::Union::OwnedVirtualDisplayRequest(_)) => {
+                "misc.owned_virtual_display_request"
+            }
+            Some(misc::Union::OwnedVirtualDisplayResult(_)) => {
+                "misc.owned_virtual_display_result"
+            }
             Some(misc::Union::SwitchDisplay(_)) => "misc.switch_display",
             Some(misc::Union::Option(_)) => "misc.option",
             Some(misc::Union::AudioFormat(_)) => "misc.audio_format",
@@ -6164,7 +6414,18 @@ async fn start_ipc(
         stream = Some(s);
     }
     if stream.is_none() {
-        let args = vec!["--cm"];
+        // A password-authenticated macOS session does not need an approval
+        // window. Starting a second Flutter NSApplication for the CM can
+        // tear down inside CVDisplayLink before the video session is
+        // authorized, leaving the peer connected but waiting for video.
+        let args = if cfg!(target_os = "macos")
+            && hbb_common::password_security::approve_mode()
+                == hbb_common::password_security::ApproveMode::Password
+        {
+            vec!["--cm-no-ui"]
+        } else {
+            vec!["--cm"]
+        };
         let run_done;
         if crate::platform::is_root() {
             let mut res = Ok(None);
@@ -6506,6 +6767,12 @@ impl Default for PortableState {
 
 impl Drop for Connection {
     fn drop(&mut self) {
+        #[cfg(target_os = "macos")]
+        self.end_remote_mic_route();
+
+        #[cfg(target_os = "macos")]
+        super::owned_virtual_display_runtime::disconnected(self.inner.id());
+
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         self.release_pressed_modifiers();
 
@@ -7186,6 +7453,29 @@ mod test {
         let pos = msg.cursor_position();
         assert_eq!(pos.x, 510);
         assert_eq!(pos.y, 510);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn new_subscriber_peer_info_replaces_display_size_snapshot() {
+        let mut conn = ConnInner::new(77, None, None);
+        conn.display_sizes.lock().unwrap().insert(4, (640, 480));
+        let mut peer_info = PeerInfo::new();
+        peer_info.displays.push(DisplayInfo {
+            width: 1280,
+            height: 800,
+            ..Default::default()
+        });
+        let mut message = Message::new();
+        message.set_peer_info(peer_info);
+
+        // Exercise the existing protocol dispatch used by display_service for
+        // a new subscriber, rather than a test-only map update helper.
+        conn.send(Arc::new(message));
+
+        let sizes = conn.display_sizes.lock().unwrap();
+        assert_eq!(sizes.get(&0), Some(&(1280, 800)));
+        assert!(!sizes.contains_key(&4));
     }
 
     #[test]

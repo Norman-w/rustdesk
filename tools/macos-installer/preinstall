@@ -1,0 +1,68 @@
+#!/bin/bash
+set -eu
+
+bundle_id="com.carriez.NormanRemoteDesktop"
+app_path="/Applications/NormanRemoteDesktop.app"
+service_label="system/com.carriez.NormanRemoteDesktop_service"
+service_plist="/Library/LaunchDaemons/com.carriez.NormanRemoteDesktop_service.plist"
+state_file="/var/tmp/com.carriez.NormanRemoteDesktop.pkg-install-state"
+
+console_user=$(/usr/bin/stat -f '%Su' /dev/console 2>/dev/null || printf 'root')
+console_uid=""
+if [ "$console_user" != "root" ] && [ "$console_user" != "loginwindow" ]; then
+  console_uid=$(/usr/bin/id -u "$console_user" 2>/dev/null || true)
+fi
+
+service_was_loaded=0
+if /bin/launchctl print "$service_label" >/dev/null 2>&1; then
+  service_was_loaded=1
+fi
+
+restore_service_on_failure() {
+  result=$?
+  trap - EXIT
+  if [ "$result" -ne 0 ] && [ "$service_was_loaded" -eq 1 ] && [ -f "$service_plist" ]; then
+    /bin/launchctl bootstrap system "$service_plist" >/dev/null 2>&1 || true
+    /bin/launchctl kickstart -k "$service_label" >/dev/null 2>&1 || true
+  fi
+  exit "$result"
+}
+trap restore_service_on_failure EXIT
+
+/usr/bin/printf '%s\n' "$service_was_loaded" > "$state_file"
+/usr/sbin/chown root:wheel "$state_file" 2>/dev/null || true
+/bin/chmod 600 "$state_file"
+
+if [ "$service_was_loaded" -eq 1 ]; then
+  printf 'Stopping the Norman Remote Desktop service before replacement...\n'
+  /bin/launchctl bootout "$service_label" >/dev/null 2>&1 ||
+    /bin/launchctl kill SIGTERM "$service_label" >/dev/null 2>&1 || true
+fi
+
+if /usr/bin/pgrep -x NormanRemoteDesktop >/dev/null 2>&1; then
+  printf 'Closing the running Norman Remote Desktop app...\n'
+  if [ -n "$console_uid" ]; then
+    /bin/launchctl asuser "$console_uid" /usr/bin/osascript \
+      -e "tell application id \"$bundle_id\" to quit" >/dev/null 2>&1 || true
+  fi
+  for _ in $(/usr/bin/seq 1 20); do
+    /usr/bin/pgrep -x NormanRemoteDesktop >/dev/null 2>&1 || break
+    /bin/sleep 0.5
+  done
+  if /usr/bin/pgrep -x NormanRemoteDesktop >/dev/null 2>&1; then
+    printf 'The app did not close within 10 seconds; requesting graceful termination...\n'
+    /usr/bin/pkill -TERM -x NormanRemoteDesktop || true
+    for _ in $(/usr/bin/seq 1 20); do
+      /usr/bin/pgrep -x NormanRemoteDesktop >/dev/null 2>&1 || break
+      /bin/sleep 0.5
+    done
+  fi
+fi
+
+if /usr/bin/pgrep -x NormanRemoteDesktop >/dev/null 2>&1; then
+  printf 'Norman Remote Desktop is still running; the installation was stopped.\n' >&2
+  exit 1
+fi
+
+printf 'The existing Norman Remote Desktop process is stopped.\n'
+printf 'Service plist present before replacement: %s\n' "$([ -f "$service_plist" ] && printf yes || printf no)"

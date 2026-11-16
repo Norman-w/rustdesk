@@ -2061,6 +2061,8 @@ pub struct AudioHandler {
     device_channel: u16,
     #[cfg(not(target_os = "linux"))]
     ready: Arc<std::sync::Mutex<bool>>,
+    #[cfg(not(target_os = "linux"))]
+    output_device_name: Option<String>,
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -2186,6 +2188,19 @@ impl AudioBuffer {
 }
 
 impl AudioHandler {
+    fn with_output_device_name(output_device_name: Option<String>) -> Self {
+        let mut handler = Self::default();
+        #[cfg(not(target_os = "linux"))]
+        {
+            handler.output_device_name = output_device_name;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let _ = output_device_name;
+        }
+        handler
+    }
+
     #[cfg(target_os = "linux")]
     fn start_audio(&mut self, format0: AudioFormat) -> ResultType<()> {
         use psimple::Simple;
@@ -2218,12 +2233,37 @@ impl AudioHandler {
     /// Start the audio playback.
     #[cfg(not(target_os = "linux"))]
     fn start_audio(&mut self, format0: AudioFormat) -> ResultType<()> {
-        let device = AUDIO_HOST
-            .default_output_device()
-            .with_context(|| "Failed to get default output device")?;
+        let device = if let Some(requested_name) = self.output_device_name.as_deref() {
+            let requested_name = requested_name.trim();
+            AUDIO_HOST
+                .devices()
+                .map_err(|e| anyhow!(e))?
+                .find(|candidate| {
+                    candidate
+                        .name()
+                        .map(|name| name == requested_name)
+                        .unwrap_or(false)
+                })
+                .with_context(|| {
+                    format!(
+                        "Configured remote microphone output device not found: \"{}\"",
+                        requested_name
+                    )
+                })?
+        } else {
+            AUDIO_HOST
+                .default_output_device()
+                .with_context(|| "Failed to get default output device")?
+        };
+        let device_name = device.name().unwrap_or_else(|_| "".to_owned());
         log::info!(
-            "Using default output device: \"{}\"",
-            device.name().unwrap_or("".to_owned())
+            "Using {} output device: \"{}\"",
+            if self.output_device_name.is_some() {
+                "configured remote microphone"
+            } else {
+                "default"
+            },
+            device_name
         );
         let config = device.default_output_config().map_err(|e| anyhow!(e))?;
         let sample_format = config.sample_format();
@@ -2274,10 +2314,20 @@ impl AudioHandler {
         }
         match AudioDecoder::new(f.sample_rate, if f.channels > 1 { Stereo } else { Mono }) {
             Ok(d) => {
+                #[cfg(not(target_os = "linux"))]
+                {
+                    // A new voice call must own a fresh CoreAudio stream. The
+                    // previous call can otherwise keep writing silence into
+                    // the virtual device after reconnect.
+                    drop(self.audio_stream.take());
+                    *self.ready.lock().unwrap() = false;
+                }
                 let buffer = vec![0.; f.sample_rate as usize * f.channels as usize];
                 self.audio_decoder = Some((d, buffer));
                 self.channels = f.channels as _;
-                allow_err!(self.start_audio(f));
+                if let Err(err) = self.start_audio(f) {
+                    log::error!("Failed to start remote audio output: {err:#}");
+                }
             }
             Err(err) => {
                 log::error!("Failed to create audio decoder: {}", err);
@@ -3924,10 +3974,67 @@ pub fn start_video_thread<F, T>(
 
 /// Start an audio thread
 /// Return a audio [`MediaSender`]
+///
+/// The name is only read on macOS and is intentionally opt-in. An empty or
+/// missing environment variable preserves the normal default-speaker route.
+pub fn configured_remote_mic_output_device() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(name) = std::env::var("NORMAN_REMOTE_MIC_OUTPUT_DEVICE")
+            .ok()
+            .map(|name| name.trim().to_owned())
+            .filter(|name| !name.is_empty())
+        {
+            return Some(name);
+        }
+
+        // Finder-launched RustDesk does not inherit the CM helper's
+        // environment. Read the helper's explicit, user-approved plist as a
+        // fallback so the main receiver and --cm-no-ui use the same route.
+        // The plist is only consulted when `enabled` is true; an absent or
+        // malformed file keeps the normal default-speaker behavior.
+        let home = std::env::var_os("HOME")?;
+        let config_path = std::path::PathBuf::from(home)
+            .join("Library/Application Support/NormanRemoteDesktop/cm-helper/audio-config.plist");
+        let content = std::fs::read_to_string(config_path).ok()?;
+        let enabled_region = content
+            .split_once("<key>enabled</key>")
+            .and_then(|(_, rest)| rest.split_once("<key>"))
+            .map(|(value, _)| value)
+            .unwrap_or("");
+        if !enabled_region.contains("<true/>") {
+            return None;
+        }
+        let value_region = content
+            .split_once("<key>outputDeviceName</key>")
+            .and_then(|(_, rest)| rest.split_once("<key>").map(|(value, _)| value))
+            .unwrap_or("");
+        let value_start = value_region.find("<string>")? + "<string>".len();
+        let value_end = value_region[value_start..].find("</string>")? + value_start;
+        let name = value_region[value_start..value_end].trim();
+        if name.is_empty() {
+            None
+        } else {
+            Some(name.to_owned())
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
 pub fn start_audio_thread() -> MediaSender {
+    start_audio_thread_with_output_device(None)
+}
+
+/// Start an audio thread and optionally route decoded incoming audio to an
+/// explicitly named output device. The caller owns the opt-in decision; a
+/// missing name keeps the normal default-speaker behavior.
+pub fn start_audio_thread_with_output_device(output_device_name: Option<String>) -> MediaSender {
     let (audio_sender, audio_receiver) = mpsc::channel::<MediaData>();
     std::thread::spawn(move || {
-        let mut audio_handler = AudioHandler::default();
+        let mut audio_handler = AudioHandler::with_output_device_name(output_device_name);
         loop {
             if let Ok(data) = audio_receiver.recv() {
                 match data {
