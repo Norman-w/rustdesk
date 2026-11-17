@@ -2564,6 +2564,27 @@ connectMainDesktop(String id,
   }
 }
 
+Future<void> _showConnectFailure(
+    BuildContext context, Object error, StackTrace stackTrace) async {
+  debugPrint('[Connection] failed: $error\n$stackTrace');
+  if (!context.mounted) return;
+  final message = error.toString().replaceFirst(RegExp(r'^Exception: '), '');
+  await showDialog<void>(
+    context: context,
+    builder: (dialogContext) => AlertDialog(
+      title: Text(translate('Connection failed')),
+      content: SelectableText(
+          message.isEmpty ? translate('Unknown error') : message),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(dialogContext).pop(),
+          child: Text(translate('OK')),
+        ),
+      ],
+    ),
+  );
+}
+
 /// Connect to a peer with [id].
 /// If [isFileTransfer], starts a session only for file transfer.
 /// If [isViewCamera], starts a session only for view camera.
@@ -2594,37 +2615,50 @@ connect(BuildContext context, String id,
   }
   id = id.replaceAll(' ', '');
   final oldId = id;
-  id = await bind.mainHandleRelayId(id: id);
+  try {
+    id = await bind.mainHandleRelayId(id: id);
+  } catch (error, stackTrace) {
+    await _showConnectFailure(context, error, stackTrace);
+    return;
+  }
   forceRelay = id != oldId || forceRelay;
   assert(!(isFileTransfer && isTcpTunneling && isRDP),
       "more than one connect type");
 
   if (isDesktop) {
     if (desktopType == DesktopType.main) {
-      await connectMainDesktop(
-        id,
-        isFileTransfer: isFileTransfer,
-        isViewCamera: isViewCamera,
-        isTerminal: isTerminal,
-        isTcpTunneling: isTcpTunneling,
-        isRDP: isRDP,
-        password: password,
-        isSharedPassword: isSharedPassword,
-        forceRelay: forceRelay,
-      );
+      try {
+        await connectMainDesktop(
+          id,
+          isFileTransfer: isFileTransfer,
+          isViewCamera: isViewCamera,
+          isTerminal: isTerminal,
+          isTcpTunneling: isTcpTunneling,
+          isRDP: isRDP,
+          password: password,
+          isSharedPassword: isSharedPassword,
+          forceRelay: forceRelay,
+        );
+      } catch (error, stackTrace) {
+        await _showConnectFailure(context, error, stackTrace);
+      }
     } else {
-      await rustDeskWinManager.call(WindowType.Main, kWindowConnect, {
-        'id': id,
-        'isFileTransfer': isFileTransfer,
-        'isViewCamera': isViewCamera,
-        'isTerminal': isTerminal,
-        'isTcpTunneling': isTcpTunneling,
-        'isRDP': isRDP,
-        'password': password,
-        'isSharedPassword': isSharedPassword,
-        'forceRelay': forceRelay,
-        'connToken': connToken,
-      });
+      try {
+        await rustDeskWinManager.call(WindowType.Main, kWindowConnect, {
+          'id': id,
+          'isFileTransfer': isFileTransfer,
+          'isViewCamera': isViewCamera,
+          'isTerminal': isTerminal,
+          'isTcpTunneling': isTcpTunneling,
+          'isRDP': isRDP,
+          'password': password,
+          'isSharedPassword': isSharedPassword,
+          'forceRelay': forceRelay,
+          'connToken': connToken,
+        });
+      } catch (error, stackTrace) {
+        await _showConnectFailure(context, error, stackTrace);
+      }
     }
   } else {
     if (isFileTransfer) {
