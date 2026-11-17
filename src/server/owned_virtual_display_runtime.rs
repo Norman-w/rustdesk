@@ -9,7 +9,7 @@ use super::owned_virtual_display::{
     PendingFrameConfirmation, ReleasePlan, Target,
 };
 use hbb_common::log;
-use hbb_common::message_proto::{
+use base::message_proto::{
     OwnedVirtualDisplayCapabilities, OwnedVirtualDisplayOperation, OwnedVirtualDisplayRequest,
     OwnedVirtualDisplayResult, OwnedVirtualDisplayStatus, Resolution,
 };
@@ -1036,7 +1036,7 @@ fn native_status_to_protocol(status: i32) -> OwnedVirtualDisplayStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hbb_common::message_proto::OwnedVirtualDisplayOperation;
+    use base::message_proto::OwnedVirtualDisplayOperation;
     use std::sync::Mutex;
 
     fn request(request_id: u64) -> OwnedVirtualDisplayRequest {

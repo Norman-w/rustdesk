@@ -134,6 +134,7 @@ message PeerInfo {
   // NOTE: Only support one-level dictionaries (for peer to update), and the key is of type string.
   string platform_additions = 12;
   WindowsSessions windows_sessions = 13;
+  OwnedVirtualDisplayCapabilities owned_virtual_display = 14;
 }
 
 message WindowsSession {  
@@ -619,6 +620,64 @@ message ToggleVirtualDisplay {
   bool on = 2;
 }
 
+message OwnedVirtualDisplayCapabilities {
+  uint32 protocol_version = 1;
+  bool supported = 2;
+  bool ready = 3;
+  bool control_allowed = 4;
+  uint32 max_width = 5;
+  uint32 max_height = 6;
+  uint64 max_pixels = 7;
+  uint32 width_alignment = 8;
+  uint32 height_alignment = 9;
+}
+
+enum OwnedVirtualDisplayOperation {
+  OWNED_DISPLAY_OPERATION_UNSPECIFIED = 0;
+  OWNED_DISPLAY_OPERATION_APPLY = 1;
+  OWNED_DISPLAY_OPERATION_RELEASE = 2;
+}
+
+enum OwnedVirtualDisplayStatus {
+  OWNED_DISPLAY_STATUS_UNSPECIFIED = 0;
+  OWNED_DISPLAY_STATUS_PENDING = 1;
+  OWNED_DISPLAY_STATUS_APPLIED = 2;
+  OWNED_DISPLAY_STATUS_CONFIRMED = 3;
+  OWNED_DISPLAY_STATUS_RELEASED = 4;
+  OWNED_DISPLAY_STATUS_FAILED = 5;
+  OWNED_DISPLAY_STATUS_BUSY = 6;
+  OWNED_DISPLAY_STATUS_UNSUPPORTED = 7;
+  OWNED_DISPLAY_STATUS_PERMISSION_DENIED = 8;
+  OWNED_DISPLAY_STATUS_INVALID_TARGET = 9;
+  OWNED_DISPLAY_STATUS_STALE = 10;
+  OWNED_DISPLAY_STATUS_TIMED_OUT = 11;
+}
+
+message OwnedVirtualDisplayRequest {
+  uint64 request_id = 1;
+  uint64 generation = 2;
+  OwnedVirtualDisplayOperation operation = 3;
+  // Zero acquires this connection's first lease. Nonzero values must match
+  // the server-issued lease belonging to this authenticated connection.
+  uint64 lease_id = 4;
+  Resolution requested = 5;
+}
+
+message OwnedVirtualDisplayResult {
+  uint64 request_id = 1;
+  uint64 generation = 2;
+  OwnedVirtualDisplayOperation operation = 3;
+  OwnedVirtualDisplayStatus status = 4;
+  uint64 lease_id = 5;
+  Resolution requested = 6;
+  Resolution normalized = 7;
+  Resolution actual = 8;
+  uint32 display_id = 9;
+  int32 display_index = 10;
+  int32 error_code = 11;
+  string error_message = 12;
+}
+
 message TogglePrivacyMode {
   string impl_key = 1;
   bool on = 2;
@@ -857,6 +916,8 @@ message Misc {
     DisplayResolution change_display_resolution = 36;
     MessageQuery message_query = 37;
     int32 follow_current_display = 38;
+    OwnedVirtualDisplayRequest owned_virtual_display_request = 39;
+    OwnedVirtualDisplayResult owned_virtual_display_result = 40;
   }
 }
 
