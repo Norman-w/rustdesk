@@ -22,6 +22,15 @@ class AppDelegate: FlutterAppDelegate {
       NSApplication.shared.terminate(self)
   }
 
+  // The standard NSApplication `terminate:` action is also used by AppKit's
+  // automatic-termination path.  This app deliberately cancels that automatic
+  // path while its menu-bar/service process is alive, so the Quit menu item
+  // must call an explicit user-request action instead.  Otherwise Command-Q
+  // is silently cancelled and the foreground app appears impossible to close.
+  @IBAction func terminateApplication(_ sender: Any?) {
+      terminateForUserRequest()
+  }
+
   override func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
       dummy_method_to_enforce_bundling()
     // https://github.com/leanflutter/window_manager/issues/214
