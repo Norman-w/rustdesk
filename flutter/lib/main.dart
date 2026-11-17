@@ -432,7 +432,10 @@ WindowOptions getHiddenTitleBarWindowOptions(
     size: size,
     center: center,
     backgroundColor: (isMacOS && isMainWindow) ? null : Colors.transparent,
-    skipTaskbar: false,
+    // The menu-bar service owns the macOS app lifecycle. Keep all Flutter
+    // windows out of the Dock so closing a window does not leave a second
+    // application entry behind; the tray icon remains the reopen affordance.
+    skipTaskbar: isMacOS,
     titleBarStyle: defaultTitleBarStyle,
     alwaysOnTop: alwaysOnTop,
   );
