@@ -145,6 +145,13 @@ void runMainApp(bool startService) async {
   gFFI.userModel.refreshCurrentUser();
   runApp(App());
 
+  // macOS uses the service/tray as the resident entry point.  Keep the
+  // foreground UI out of the Dock even while its window is open; the tray
+  // icon remains the way to reopen it after Command/Ctrl-W hides the window.
+  if (isMacOS) {
+    bind.mainHideDock();
+  }
+
   bool? alwaysOnTop;
   if (isDesktop) {
     alwaysOnTop =
