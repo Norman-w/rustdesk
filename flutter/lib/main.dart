@@ -278,8 +278,15 @@ void runMultiWindow(
       // no such appType
       exit(0);
   }
-  // show window from hidden status
-  WindowController.fromWindowId(kWindowId!).show();
+  // Show and focus the child window after its frame has been restored. On
+  // macOS, calling show() alone can leave the newly-created remote window
+  // behind the main/settings window, making a successful Connect click look
+  // like a no-op. The child content is already mounted at this point, so a
+  // focus call is safe and avoids the black pre-render race from showing it
+  // before Flutter has built the screen.
+  final childWindow = WindowController.fromWindowId(kWindowId!);
+  await childWindow.show();
+  await childWindow.focus();
 }
 
 void runConnectionManagerScreen() async {
