@@ -37,7 +37,6 @@ class AppDelegate: FlutterAppDelegate {
       task.standardError = FileHandle.nullDevice
       do {
           try task.run()
-          task.waitUntilExit()
       } catch {
           NSLog("[RustDesk] Failed to stop the background service: %@", error.localizedDescription)
       }

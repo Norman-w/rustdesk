@@ -90,6 +90,24 @@ class MainFlutterWindow: NSWindow {
         super.awakeFromNib()
     }
 
+    // Cmd-W is the macOS equivalent of closing the management panel.  Flutter
+    // does not consistently forward this native key equivalent through the
+    // window-manager plugin, so handle it here and keep the user-session host
+    // service alive just like clicking the red close button.
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if modifiers.contains(.command),
+           event.charactersIgnoringModifiers?.lowercased() == "w" {
+            if let appDelegate = NSApplication.shared.delegate as? AppDelegate {
+                appDelegate.terminateForUserRequest(stopService: false)
+            } else {
+                close()
+            }
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
+
     /// Override window theme.
     public func setWindowInterfaceMode(window: NSWindow, themeName: String) {
         window.appearance = NSAppearance(named: themeName == "light" ? .aqua : .darkAqua)
