@@ -190,32 +190,46 @@ fn make_tray() -> hbb_common::ResultType<()> {
         if let Ok(event) = menu_channel.try_recv() {
             if let Some(quit_i) = &quit_i {
                 if event.id == quit_i.id() {
-                    /* failed in windows, seems no permission to check system process
-                    if !crate::check_process("--server", false) {
+                    #[cfg(target_os = "macos")]
+                    {
+                        // macOS keeps the privileged LaunchDaemon as a
+                        // helper, while this tray process is the user-session
+                        // host service.  Stop only this service so reopening
+                        // the management UI can start it again without an
+                        // uninstall/reinstall prompt.
+                        crate::server::stop_main_window_process_without_relaunch();
                         *control_flow = ControlFlow::Exit;
                         return;
                     }
-                    */
-                    // Remove the icon first: on success `uninstall_service()` ends
-                    // this process with `std::process::exit`, which skips the
-                    // destructor that would remove it, leaving a ghost icon behind.
-                    #[cfg(windows)]
-                    let _ = _tray_icon
-                        .lock()
-                        .unwrap()
-                        .as_mut()
-                        .map(|t| t.set_visible(false));
-                    if !crate::platform::uninstall_service(false, false) {
-                        *control_flow = ControlFlow::Exit;
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        /* failed in windows, seems no permission to check system process
+                        if !crate::check_process("--server", false) {
+                            *control_flow = ControlFlow::Exit;
+                            return;
+                        }
+                        */
+                        // Remove the icon first: on success `uninstall_service()` ends
+                        // this process with `std::process::exit`, which skips the
+                        // destructor that would remove it, leaving a ghost icon behind.
+                        #[cfg(windows)]
+                        let _ = _tray_icon
+                            .lock()
+                            .unwrap()
+                            .as_mut()
+                            .map(|t| t.set_visible(false));
+                        if !crate::platform::uninstall_service(false, false) {
+                            *control_flow = ControlFlow::Exit;
+                        }
+                        // Still alive, so stopping the service failed or was cancelled
+                        // in the UAC prompt. Show the icon again.
+                        #[cfg(windows)]
+                        let _ = _tray_icon
+                            .lock()
+                            .unwrap()
+                            .as_mut()
+                            .map(|t| t.set_visible(true));
                     }
-                    // Still alive, so stopping the service failed or was cancelled
-                    // in the UAC prompt. Show the icon again.
-                    #[cfg(windows)]
-                    let _ = _tray_icon
-                        .lock()
-                        .unwrap()
-                        .as_mut()
-                        .map(|t| t.set_visible(true));
                 } else if event.id == open_i.id() {
                     open_func();
                 }

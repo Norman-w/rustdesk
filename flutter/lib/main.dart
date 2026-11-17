@@ -145,13 +145,6 @@ void runMainApp(bool startService) async {
   gFFI.userModel.refreshCurrentUser();
   runApp(App());
 
-  // macOS uses the service/tray as the resident entry point.  Keep the
-  // foreground UI out of the Dock even while its window is open; the tray
-  // icon remains the way to reopen it after Command/Ctrl-W hides the window.
-  if (isMacOS) {
-    bind.mainHideDock();
-  }
-
   bool? alwaysOnTop;
   if (isDesktop) {
     alwaysOnTop =
@@ -432,10 +425,10 @@ WindowOptions getHiddenTitleBarWindowOptions(
     size: size,
     center: center,
     backgroundColor: (isMacOS && isMainWindow) ? null : Colors.transparent,
-    // The menu-bar service owns the macOS app lifecycle. Keep all Flutter
-    // windows out of the Dock so closing a window does not leave a second
-    // application entry behind; the tray icon remains the reopen affordance.
-    skipTaskbar: isMacOS,
+    // The normal management panel is a regular foreground application and
+    // therefore gets one Dock entry.  Hidden connection-manager windows call
+    // mainHideDock() explicitly after their window options are applied.
+    skipTaskbar: false,
     titleBarStyle: defaultTitleBarStyle,
     alwaysOnTop: alwaysOnTop,
   );

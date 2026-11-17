@@ -17,9 +17,30 @@ class AppDelegate: FlutterAppDelegate {
       return .terminateCancel
   }
 
-  func terminateForUserRequest() {
+  func terminateForUserRequest(stopService: Bool = true) {
+      if stopService {
+          stopBackgroundService()
+      }
       terminationWasRequested = true
       NSApplication.shared.terminate(self)
+  }
+
+  private func stopBackgroundService() {
+      guard let executablePath = Bundle.main.executablePath else {
+          NSLog("[RustDesk] Cannot locate the app executable to stop the background service")
+          return
+      }
+      let task = Process()
+      task.executableURL = URL(fileURLWithPath: executablePath)
+      task.arguments = ["--quit-service"]
+      task.standardOutput = FileHandle.nullDevice
+      task.standardError = FileHandle.nullDevice
+      do {
+          try task.run()
+          task.waitUntilExit()
+      } catch {
+          NSLog("[RustDesk] Failed to stop the background service: %@", error.localizedDescription)
+      }
   }
 
   // The standard NSApplication `terminate:` action is also used by AppKit's

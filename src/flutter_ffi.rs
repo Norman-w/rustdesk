@@ -2129,6 +2129,12 @@ pub fn main_stop_service() {
         config::Config::set_option("stop-service".into(), "Y".into());
         crate::rendezvous_mediator::RendezvousMediator::restart();
     }
+    #[cfg(target_os = "macos")]
+    {
+        // The host server is a separate --server process.  Stopping it must
+        // not terminate the management UI itself.
+        crate::server::stop_main_window_process_without_relaunch();
+    }
 }
 
 pub fn main_start_service() {
@@ -2141,7 +2147,14 @@ pub fn main_start_service() {
     #[cfg(target_os = "macos")]
     {
         config::Config::set_option("stop-service".into(), "".into());
-        std::thread::spawn(|| crate::start_server(false, false));
+        // Keep the host server independent from the Flutter management UI.
+        // This guarantees that closing the UI leaves exactly one background
+        // service alive and avoids spawning duplicate in-process servers.
+        if !crate::check_process("--server", true) {
+            if let Err(err) = crate::run_me(vec!["--server"]) {
+                log::error!("failed to start macOS host server: {}", err);
+            }
+        }
     }
 }
 

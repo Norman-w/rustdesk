@@ -210,7 +210,10 @@ class MainFlutterWindow: NSWindow {
                     break;
                 case "terminate":
                     if let appDelegate = NSApplication.shared.delegate as? AppDelegate {
-                        appDelegate.terminateForUserRequest()
+                        // Closing the management window is not an explicit
+                        // application Quit: keep the independent --server
+                        // process running so the tray/service remains alive.
+                        appDelegate.terminateForUserRequest(stopService: false)
                     } else {
                         NSApplication.shared.terminate(self)
                     }

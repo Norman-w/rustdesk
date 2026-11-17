@@ -892,3 +892,40 @@ pub async fn stop_main_window_process() {
         }
     }
 }
+
+/// Stop the macOS user-session host service without triggering the legacy
+/// IPC close/relaunch path.  The normal `Data::Close` message deliberately
+/// reopens the app after a service restart; that is correct for crash/restart
+/// recovery but wrong for an explicit Quit from the management UI or tray.
+#[cfg(target_os = "macos")]
+pub fn stop_main_window_process_without_relaunch() {
+    use hbb_common::sysinfo::{Signal, System};
+
+    let Ok(current_exe) = std::fs::canonicalize(std::env::current_exe().unwrap_or_default()) else {
+        log::error!("failed to resolve current executable while stopping macOS host service");
+        return;
+    };
+    let current_pid = hbb_common::sysinfo::Pid::from_u32(std::process::id());
+    let mut system = System::new();
+    system.refresh_processes();
+
+    for process in system.processes().values() {
+        if process.pid() == current_pid
+            || process.cmd().get(1).map_or(true, |arg| arg != "--server")
+        {
+            continue;
+        }
+        let Ok(process_exe) = std::fs::canonicalize(process.exe()) else {
+            continue;
+        };
+        if process_exe != current_exe {
+            continue;
+        }
+        match process.kill_with(Signal::Term) {
+            Some(true) => log::info!("stopped macOS host service pid {}", process.pid()),
+            Some(false) | None => {
+                log::warn!("failed to stop macOS host service pid {}", process.pid())
+            }
+        }
+    }
+}

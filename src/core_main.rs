@@ -59,6 +59,7 @@ pub fn core_main() -> Option<Vec<String>> {
     let mut _is_run_as_system = false;
     let mut _is_quick_support = false;
     let mut _is_flutter_invoke_new_connection = false;
+    #[cfg(not(target_os = "macos"))]
     let mut no_server = false;
     let mut arg_exe = Default::default();
     for arg in std::env::args() {
@@ -86,7 +87,10 @@ pub fn core_main() -> Option<Vec<String>> {
             } else if arg == "--quick_support" {
                 _is_quick_support = true;
             } else if arg == "--no-server" {
-                no_server = true;
+                #[cfg(not(target_os = "macos"))]
+                {
+                    no_server = true;
+                }
             } else {
                 args.push(arg);
             }
@@ -215,6 +219,12 @@ pub fn core_main() -> Option<Vec<String>> {
             crate::platform::try_remove_temp_update_files();
             hbb_common::config::PeerConfig::preload_peers();
         }
+        // On macOS the Flutter management panel owns the foreground
+        // lifecycle, while the user-session host server is launched as a
+        // separate `--server` process by main_start_service().  Starting the
+        // fallback server in this process would make closing the panel kill
+        // the service and could create duplicate server instances.
+        #[cfg(not(target_os = "macos"))]
         std::thread::spawn(move || crate::start_server(false, no_server));
     } else {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -432,6 +442,13 @@ pub fn core_main() -> Option<Vec<String>> {
                 // prevent server exit when encountering errors from tray
                 hbb_common::allow_err!(handler.join());
             }
+            return None;
+        } else if args[0] == "--quit-service" {
+            // Explicit application Quit stops the independent user-session
+            // host server.  Closing the management window uses a different
+            // native path and intentionally leaves this process running.
+            #[cfg(target_os = "macos")]
+            crate::server::stop_main_window_process_without_relaunch();
             return None;
         } else if args[0] == "--import-config" {
             if args.len() == 2 {
