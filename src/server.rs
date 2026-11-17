@@ -901,6 +901,11 @@ pub async fn stop_main_window_process() {
 pub fn stop_main_window_process_without_relaunch() {
     use hbb_common::sysinfo::{Signal, System};
 
+    // Also tell the rendezvous/audio layers to stop accepting work.  The next
+    // normal management-panel launch clears this flag before starting the
+    // user-session host again.
+    hbb_common::config::Config::set_option("stop-service".into(), "Y".into());
+
     let Ok(current_exe) = std::fs::canonicalize(std::env::current_exe().unwrap_or_default()) else {
         log::error!("failed to resolve current executable while stopping macOS host service");
         return;
