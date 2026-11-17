@@ -151,7 +151,14 @@ class RustDeskMultiWindowManager {
     List<int> windows,
     bool withScreenRect,
   ) async {
-    final windowController = await DesktopMultiWindow.createWindow(msg);
+    late final WindowController windowController;
+    try {
+      windowController = await DesktopMultiWindow.createWindow(msg);
+    } catch (error, stackTrace) {
+      debugPrint(
+          '[MultiWindow] failed to create $type window for $remoteId: $error\n$stackTrace');
+      rethrow;
+    }
     if (isWindows) {
       windowController.setInitBackgroundColor(Colors.black);
     }
@@ -176,6 +183,7 @@ class RustDeskMultiWindowManager {
     // frame on macOS and can race the first remote session event.
     registerActiveWindow(windowId);
     windows.add(windowId);
+    debugPrint('[MultiWindow] created $type window $windowId for $remoteId');
     return windowId;
   }
 

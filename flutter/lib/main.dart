@@ -99,11 +99,13 @@ Future<void> main(List<String> args) async {
       default:
         break;
     }
-  } else if (args.isNotEmpty && args.first == '--cm') {
-    debugPrint("--cm started");
+  } else if (args.isNotEmpty &&
+      (args.first == '--cm' || args.first == '--cm-no-ui')) {
+    final hiddenConnectionManager = args.first == '--cm-no-ui';
+    debugPrint("${args.first} started");
     desktopType = DesktopType.cm;
     await windowManager.ensureInitialized();
-    runConnectionManagerScreen();
+    runConnectionManagerScreen(forceHidden: hiddenConnectionManager);
   } else if (args.contains('--install')) {
     runInstallPage();
   } else {
@@ -285,18 +287,22 @@ void runMultiWindow(
   // focus call is safe and avoids the black pre-render race from showing it
   // before Flutter has built the screen.
   final childWindow = WindowController.fromWindowId(kWindowId!);
+  // runApp schedules the first build; wait for that frame before asking
+  // AppKit to activate the window so a child cannot appear as an empty/hidden
+  // placeholder while Flutter is still mounting RemotePage.
+  await WidgetsBinding.instance.endOfFrame;
   await childWindow.show();
   await childWindow.focus();
 }
 
-void runConnectionManagerScreen() async {
+void runConnectionManagerScreen({bool forceHidden = false}) async {
   await initEnv(kAppTypeConnectionManager);
   _runApp(
     '',
     const DesktopServerPage(),
     MyTheme.currentThemeMode(),
   );
-  final hide = await bind.cmGetConfig(name: "hide_cm") == 'true';
+  final hide = forceHidden || await bind.cmGetConfig(name: "hide_cm") == 'true';
   gFFI.serverModel.hideCm = hide;
   if (hide) {
     await hideCmWindow(isStartup: true);

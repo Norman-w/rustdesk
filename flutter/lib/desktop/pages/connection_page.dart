@@ -208,6 +208,7 @@ class _ConnectionPageState extends State<ConnectionPage>
   String selectedConnectionType = 'Connect';
 
   bool isWindowMinimized = false;
+  bool _isConnecting = false;
 
   final AllPeersLoader _allPeersLoader = AllPeersLoader();
 
@@ -224,7 +225,11 @@ class _ConnectionPageState extends State<ConnectionPage>
     if (_idController.text.isEmpty) {
       WidgetsBinding.instance.addPostFrameCallback((_) async {
         final lastRemoteId = await bind.mainGetLastRemoteId();
-        if (lastRemoteId != _idController.id) {
+        // Do not overwrite an address typed while the native lookup was in
+        // flight.  The visible field is the user's most recent intent.
+        if (mounted &&
+            _idController.id.isEmpty &&
+            _idEditingController.text.isEmpty) {
           setState(() {
             _idController.id = lastRemoteId;
           });
@@ -327,17 +332,57 @@ class _ConnectionPageState extends State<ConnectionPage>
 
   /// Callback for the connect button.
   /// Connects to the selected peer.
-  void onConnect(
+  Future<void> onConnect(
       {bool isFileTransfer = false,
       bool isViewCamera = false,
       bool isTerminal = false,
       bool isTcpTunneling = false}) {
-    var id = _idController.id;
-    connect(context, id,
-        isFileTransfer: isFileTransfer,
-        isViewCamera: isViewCamera,
-        isTerminal: isTerminal,
-        isTcpTunneling: isTcpTunneling);
+    // RawAutocomplete owns the visible field controller.  Keep the dedicated
+    // ID controller as the canonical value, but fall back to the visible
+    // controller so a click cannot silently become a no-op when the two
+    // controllers are briefly out of sync during a rebuild.
+    final visibleId = trimID(_idEditingController.text);
+    final id = visibleId.isNotEmpty ? visibleId : _idController.id;
+    if (id.isEmpty) {
+      showToast(translate('Invalid ID'));
+      return Future<void>.value();
+    }
+    if (_idController.id != id) {
+      _idController.id = id;
+    }
+
+    if (_isConnecting) return Future<void>.value();
+    setState(() => _isConnecting = true);
+    debugPrint('[Connection] connect clicked id=$id');
+
+    return connect(
+      context,
+      id,
+      isFileTransfer: isFileTransfer,
+      isViewCamera: isViewCamera,
+      isTerminal: isTerminal,
+      isTcpTunneling: isTcpTunneling,
+    ).timeout(
+      const Duration(seconds: 15),
+      onTimeout: () async {
+        if (!mounted) return;
+        await showDialog<void>(
+          context: context,
+          builder: (dialogContext) => AlertDialog(
+            title: Text(translate('Connection failed')),
+            content: Text(translate('Connection startup timed out')),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(dialogContext).pop(),
+                child: Text(translate('OK')),
+              ),
+            ],
+          ),
+        );
+      },
+    ).whenComplete(() {
+      if (mounted) setState(() => _isConnecting = false);
+    });
   }
 
   /// UI for the remote ID TextField.
@@ -521,10 +566,14 @@ class _ConnectionPageState extends State<ConnectionPage>
                 SizedBox(
                   height: 28.0,
                   child: ElevatedButton(
-                    onPressed: () {
-                      onConnect();
-                    },
-                    child: Text(translate("Connect")),
+                    onPressed: _isConnecting ? null : () => onConnect(),
+                    child: _isConnecting
+                        ? const SizedBox(
+                            width: 14,
+                            height: 14,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : Text(translate("Connect")),
                   ),
                 ),
                 const SizedBox(width: 8),

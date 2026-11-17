@@ -2522,7 +2522,7 @@ List<String>? urlLinkToCmdArgs(Uri uri) {
   return null;
 }
 
-connectMainDesktop(String id,
+Future<MultiWindowCallResult> connectMainDesktop(String id,
     {required bool isFileTransfer,
     required bool isViewCamera,
     required bool isTerminal,
@@ -2532,36 +2532,41 @@ connectMainDesktop(String id,
     String? password,
     String? connToken,
     bool? isSharedPassword}) async {
+  late final MultiWindowCallResult result;
   if (isFileTransfer) {
-    await rustDeskWinManager.newFileTransfer(id,
+    result = await rustDeskWinManager.newFileTransfer(id,
         password: password,
         isSharedPassword: isSharedPassword,
         connToken: connToken,
         forceRelay: forceRelay);
   } else if (isViewCamera) {
-    await rustDeskWinManager.newViewCamera(id,
+    result = await rustDeskWinManager.newViewCamera(id,
         password: password,
         isSharedPassword: isSharedPassword,
         connToken: connToken,
         forceRelay: forceRelay);
   } else if (isTcpTunneling || isRDP) {
-    await rustDeskWinManager.newPortForward(id, isRDP,
+    result = await rustDeskWinManager.newPortForward(id, isRDP,
         password: password,
         isSharedPassword: isSharedPassword,
         connToken: connToken,
         forceRelay: forceRelay);
   } else if (isTerminal) {
-    await rustDeskWinManager.newTerminal(id,
+    result = await rustDeskWinManager.newTerminal(id,
         password: password,
         isSharedPassword: isSharedPassword,
         connToken: connToken,
         forceRelay: forceRelay);
   } else {
-    await rustDeskWinManager.newRemoteDesktop(id,
+    result = await rustDeskWinManager.newRemoteDesktop(id,
         password: password,
         isSharedPassword: isSharedPassword,
         forceRelay: forceRelay);
   }
+  if (result.windowId == kInvalidWindowId) {
+    throw StateError('Remote window could not be created');
+  }
+  return result;
 }
 
 Future<void> _showConnectFailure(
@@ -2590,7 +2595,7 @@ Future<void> _showConnectFailure(
 /// If [isViewCamera], starts a session only for view camera.
 /// If [isTcpTunneling], starts a session only for tcp tunneling.
 /// If [isRDP], starts a session only for rdp.
-connect(BuildContext context, String id,
+Future<void> connect(BuildContext context, String id,
     {bool isFileTransfer = false,
     bool isViewCamera = false,
     bool isTerminal = false,
