@@ -59,11 +59,31 @@ test('build and packaging have no HarmonyOS checkout or installed app dependency
 
 test('installer and build verification never request TCC permissions', () => {
   for (const file of ['tools/rustdesk-cm-helper/postinstall', 'tools/rustdesk-cm-helper/run-cm-helper.sh',
-    'tools/macos-installer/preinstall', 'tools/macos-installer/postinstall']) {
+    'tools/macos-installer/preinstall', 'tools/macos-installer/postinstall',
+    'tools/macos-installer/finalize-postinstall']) {
     const code = read(file).split('\n').filter((line) => !/^\s*#/.test(line)).join('\n');
     assert.doesNotMatch(code, /--repair-tcc|--tcc-status|tccutil|TCC\.db/);
   }
   assert.doesNotMatch(read('tools/verify-macos-distribution.sh'), /tcc_repair=|--repair-tcc 2>/);
+});
+
+test('macOS distribution is one product with selectable optional components', () => {
+  const packageScript = read('tools/package-macos-distribution.sh');
+  const distribution = read('tools/macos-installer/unified-distribution.dist');
+  const home = read('flutter/lib/desktop/pages/desktop_home_page.dart');
+  const guide = read('flutter/lib/desktop/pages/macos_setup_guide_page.dart');
+  assert.match(packageScript, /NORMAN_CM_HELPER_COMPONENT/);
+  assert.match(packageScript, /productbuild/);
+  assert.match(packageScript, /unified-distribution\.dist/);
+  assert.match(distribution, /customize="always"/);
+  assert.match(distribution, /com\.norman\.remotedesktop\.application/);
+  assert.match(distribution, /com\.norman\.remotedesktop\.cm-helper\.microphone/);
+  assert.match(distribution, /com\.norman\.remotedesktop\.cm-helper\.audio-output/);
+  assert.match(distribution, /com\.norman\.remotedesktop\.application\.finalize/);
+  assert.match(read('tools/macos-installer/finalize-postinstall'), /NormanRemoteDesktop\.app/);
+  assert.match(home, /if \(!isOutgoingOnly && !_macTccReady\(\)\)/);
+  assert.doesNotMatch(home, /_macTccReady\(\) \|\| !bind\.mainIsNormanCmHelperInstalled\(\)/);
+  assert.match(guide, /onPressed: _tccReady\n\s+\? \(\) => bind\.mainRelaunchApp\(\)/);
 });
 
 test('application version agrees with distribution scripts', () => {

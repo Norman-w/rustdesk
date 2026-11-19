@@ -21,8 +21,17 @@ agent_label="com.norman.remotedesktop-cm-no-ui"
 helper_relative="Library/Application Support/NormanRemoteDesktop/cm-helper"
 agent_name="$agent_label.plist"
 helper_version="1.3.0"
+component_kind="__COMPONENT__"
 norman_device_name="Norman 手机麦克风"
 norman_audio_output_name="Norman Remote Audio"
+
+case "$component_kind" in
+  all|microphone|audio-output) ;;
+  *)
+    echo "Unknown NormanRemoteDesktop component selection: $component_kind" >&2
+    exit 1
+    ;;
+esac
 
 app_executable=""
 for candidate in \
@@ -85,38 +94,51 @@ if [ ! -x "$support_root/bin/norman-remote-mic-device-probe" ]; then
   exit 1
 fi
 
+driver_signature="unsigned"
+audio_driver_signature="unsigned"
+
 driver_info="$virtual_input_driver/Contents/Info.plist"
 driver_executable="$virtual_input_driver/Contents/MacOS/NormanRemoteMic"
-if [ ! -f "$driver_info" ] || [ ! -x "$driver_executable" ]; then
-  echo "The unified helper payload is incomplete: Norman virtual microphone is missing."
-  exit 1
+if [ "$component_kind" = all ] || [ "$component_kind" = microphone ]; then
+  if [ ! -f "$driver_info" ] || [ ! -x "$driver_executable" ]; then
+    echo "The Norman virtual microphone component payload is incomplete."
+    exit 1
+  fi
 fi
-/usr/bin/plutil -lint "$driver_info" >/dev/null
-driver_identifier=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$driver_info" 2>/dev/null || true)
-if [ "$driver_identifier" != "com.norman.remotedesktop.virtual-mic" ]; then
-  echo "The installed Norman virtual microphone has an unexpected bundle identifier."
-  exit 1
-fi
-driver_signature="unsigned"
-if /usr/bin/codesign --verify --deep "$virtual_input_driver" >/dev/null 2>&1; then
-  driver_signature="signed"
+if [ -f "$driver_info" ] && [ -x "$driver_executable" ]; then
+  /usr/bin/plutil -lint "$driver_info" >/dev/null
+  driver_identifier=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$driver_info" 2>/dev/null || true)
+  if [ "$driver_identifier" != "com.norman.remotedesktop.virtual-mic" ]; then
+    echo "The installed Norman virtual microphone has an unexpected bundle identifier."
+    exit 1
+  fi
+  if /usr/bin/codesign --verify --deep "$virtual_input_driver" >/dev/null 2>&1; then
+    driver_signature="signed"
+  fi
+else
+  driver_signature="not-installed"
 fi
 
 audio_driver_info="$virtual_output_driver/Contents/Info.plist"
 audio_driver_executable="$virtual_output_driver/Contents/MacOS/NormanRemoteAudio"
-if [ ! -f "$audio_driver_info" ] || [ ! -x "$audio_driver_executable" ]; then
-  echo "The unified helper payload is incomplete: Norman Remote Audio output is missing."
-  exit 1
+if [ "$component_kind" = all ] || [ "$component_kind" = audio-output ]; then
+  if [ ! -f "$audio_driver_info" ] || [ ! -x "$audio_driver_executable" ]; then
+    echo "The Norman Remote Audio output component payload is incomplete."
+    exit 1
+  fi
 fi
-/usr/bin/plutil -lint "$audio_driver_info" >/dev/null
-audio_driver_identifier=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$audio_driver_info" 2>/dev/null || true)
-if [ "$audio_driver_identifier" != "com.norman.remotedesktop.virtual-audio" ]; then
-  echo "The installed Norman Remote Audio output has an unexpected bundle identifier."
-  exit 1
-fi
-audio_driver_signature="unsigned"
-if /usr/bin/codesign --verify --deep "$virtual_output_driver" >/dev/null 2>&1; then
-  audio_driver_signature="signed"
+if [ -f "$audio_driver_info" ] && [ -x "$audio_driver_executable" ]; then
+  /usr/bin/plutil -lint "$audio_driver_info" >/dev/null
+  audio_driver_identifier=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$audio_driver_info" 2>/dev/null || true)
+  if [ "$audio_driver_identifier" != "com.norman.remotedesktop.virtual-audio" ]; then
+    echo "The installed Norman Remote Audio output has an unexpected bundle identifier."
+    exit 1
+  fi
+  if /usr/bin/codesign --verify --deep "$virtual_output_driver" >/dev/null 2>&1; then
+    audio_driver_signature="signed"
+  fi
+else
+  audio_driver_signature="not-installed"
 fi
 
 helper_root="$console_home/$helper_relative"
@@ -144,6 +166,11 @@ domain="gui/$console_uid"
 /bin/cp "$support_root/bin/norman-remote-mic-device-probe" "$helper_root/bin/norman-remote-mic-device-probe"
 if [ ! -f "$config_path" ]; then
   /bin/cp "$support_root/audio-config-default.plist" "$config_path"
+  if [ "$component_kind" = audio-output ]; then
+    /usr/bin/plutil -replace enabled -bool NO "$config_path"
+    /usr/bin/plutil -replace outputDeviceName -string "" "$config_path"
+    /usr/bin/plutil -replace loopbackVerified -bool NO "$config_path"
+  fi
 else
   # Existing 1.3.0 installs were shipped with the optional route disabled.
   # Migrate only that untouched default so a first normal installation becomes
@@ -151,7 +178,8 @@ else
   # choices and explicit disables remain untouched.
   config_enabled=$(/usr/libexec/PlistBuddy -c 'Print :enabled' "$config_path" 2>/dev/null || true)
   config_device=$(/usr/libexec/PlistBuddy -c 'Print :outputDeviceName' "$config_path" 2>/dev/null || true)
-  if [ "$config_enabled" != "true" ] && [ -z "$config_device" ]; then
+  if { [ "$component_kind" = all ] || [ "$component_kind" = microphone ]; } &&
+      [ "$config_enabled" != "true" ] && [ -z "$config_device" ]; then
     /usr/bin/plutil -replace enabled -bool YES "$config_path"
     /usr/bin/plutil -replace outputDeviceName -string "$norman_device_name" "$config_path"
     /usr/bin/plutil -replace loopbackVerified -bool YES "$config_path"
@@ -164,28 +192,37 @@ fi
 config_enabled=$(/usr/libexec/PlistBuddy -c 'Print :enabled' "$config_path" 2>/dev/null || true)
 config_device=$(/usr/libexec/PlistBuddy -c 'Print :outputDeviceName' "$config_path" 2>/dev/null || true)
 config_loopback=$(/usr/libexec/PlistBuddy -c 'Print :loopbackVerified' "$config_path" 2>/dev/null || true)
-virtual_input_state="bundle-installed"
+virtual_input_state="missing"
 probe_output=""
 virtual_input_channels=0
 virtual_output_channels=0
 virtual_audio_output_state="pending-reload"
+if [ -f "$driver_info" ] && [ -x "$driver_executable" ]; then
+  virtual_input_state="bundle-installed"
+fi
 if [ -x "$helper_root/bin/norman-remote-mic-device-probe" ]; then
-  # The phone stream is consumed from the virtual device's input side. The
-  # output side is checked separately below because it is RustDesk's receiver
-  # sink, not the microphone presented to other Mac applications.
-  probe_output=$("$helper_root/bin/norman-remote-mic-device-probe" --check-input "$norman_device_name" 2>/dev/null || true)
-  virtual_input_channels=$(echo "$probe_output" | /usr/bin/sed -n 's/.*input_channels=\([0-9][0-9]*\).*/\1/p' | /usr/bin/head -n 1)
-  virtual_output_channels=$(echo "$probe_output" | /usr/bin/sed -n 's/.*output_channels=\([0-9][0-9]*\).*/\1/p' | /usr/bin/head -n 1)
-  [ -n "$virtual_input_channels" ] || virtual_input_channels=0
-  [ -n "$virtual_output_channels" ] || virtual_output_channels=0
-  if echo "$probe_output" | /usr/bin/grep -Eq 'found=1.*input_channels=[1-9][0-9]*'; then
-    virtual_input_state="available"
-  else
-    virtual_input_state="pending-reload"
+  if [ "$virtual_input_state" != "missing" ]; then
+    # The phone stream is consumed from the virtual device's input side. The
+    # output side is checked separately below because it is RustDesk's receiver
+    # sink, not the microphone presented to other Mac applications.
+    probe_output=$("$helper_root/bin/norman-remote-mic-device-probe" --check-input "$norman_device_name" 2>/dev/null || true)
+    virtual_input_channels=$(echo "$probe_output" | /usr/bin/sed -n 's/.*input_channels=\([0-9][0-9]*\).*/\1/p' | /usr/bin/head -n 1)
+    virtual_output_channels=$(echo "$probe_output" | /usr/bin/sed -n 's/.*output_channels=\([0-9][0-9]*\).*/\1/p' | /usr/bin/head -n 1)
+    [ -n "$virtual_input_channels" ] || virtual_input_channels=0
+    [ -n "$virtual_output_channels" ] || virtual_output_channels=0
+    if echo "$probe_output" | /usr/bin/grep -Eq 'found=1.*input_channels=[1-9][0-9]*'; then
+      virtual_input_state="available"
+    else
+      virtual_input_state="pending-reload"
+    fi
   fi
-  audio_probe_output=$("$helper_root/bin/norman-remote-mic-device-probe" --check-input "$norman_audio_output_name" 2>/dev/null || true)
-  if echo "$audio_probe_output" | /usr/bin/grep -Eq 'found=1.*input_channels=[1-9][0-9]*.*output_channels=[1-9][0-9]*'; then
-    virtual_audio_output_state="available"
+  if [ -f "$audio_driver_info" ] && [ -x "$audio_driver_executable" ]; then
+    audio_probe_output=$("$helper_root/bin/norman-remote-mic-device-probe" --check-input "$norman_audio_output_name" 2>/dev/null || true)
+    if echo "$audio_probe_output" | /usr/bin/grep -Eq 'found=1.*input_channels=[1-9][0-9]*.*output_channels=[1-9][0-9]*'; then
+      virtual_audio_output_state="available"
+    fi
+  else
+    virtual_audio_output_state="missing"
   fi
 fi
 

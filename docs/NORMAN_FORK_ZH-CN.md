@@ -60,6 +60,18 @@ git submodule update --init --recursive
 只构建 HAL 时运行 `tools/mac-remote-mic/build-norman-remote-mic-driver.sh`。
 这些构建命令不会安装、结束现有进程或替换 Applications 中的应用。
 
+推荐安装产物是 `NormanRemoteDesktop-1.5.0.pkg`，这是一个可自定义的总安装包：
+
+- 主程序和唯一后台 service 始终安装；
+- “手机麦克风输入”可选，安装 `Norman 手机麦克风` CoreAudio 输入设备；
+- “电脑声音虚拟输出”可选，安装 `Norman Remote Audio` CoreAudio 输出设备；
+- 安装结束后才启动管理界面，已存在的组件会按版本幂等更新；
+- TCC 权限仍由可见的 NormanRemoteDesktop.app 请求并由用户在系统设置中确认。
+
+`CMHelper` 是历史兼容包名。它不再启动独立的 CM 常驻服务；独立的 CM 服务已经由
+主程序和后台 service 管理。只有需要虚拟麦克风或虚拟输出时，才需要在总安装包中勾选
+对应的音频组件。
+
 应用构建每次从 `src/flutter_ffi.rs` 重新生成 Rust/Dart/C 绑定，再构建原生库和 Flutter 界面。
 默认特性为 `flutter,screencapturekit`，拒绝启用 `hwcodec`，不引入其 FFmpeg/libvmaf 依赖。
 上游软件编码仍需 libyuv、libvpx、aom、opus 和 libsodium；可通过上游支持的 Homebrew

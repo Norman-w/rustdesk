@@ -7,8 +7,10 @@ output_directory="${NORMAN_MACOS_OUTPUT_DIR:-$project_root/output}"
 version="${NORMAN_MACOS_VERSION:-1.5.0}"
 helper_version="${NORMAN_CM_HELPER_VERSION:-1.3.0}"
 helper_pkg_name="NormanRemoteDesktop-CMHelper-$helper_version.pkg"
+installer_pkg_name="NormanRemoteDesktop-$version.pkg"
 app_path="${NORMAN_MACOS_APP_PATH:-$output_directory/NormanRemoteDesktop.app}"
 pkg_path="${NORMAN_CM_HELPER_PKG_PATH:-$output_directory/$helper_pkg_name}"
+installer_pkg_path="$output_directory/$installer_pkg_name"
 dmg_path="${NORMAN_MACOS_DMG_PATH:-$output_directory/NormanRemoteDesktop-macOS-$version.dmg}"
 
 fail() {
@@ -72,6 +74,7 @@ NORMAN_INSTALLER_SIGNING_IDENTITY="$developer_id_installer" \
 NORMAN_DMG_SIGNING_IDENTITY="$developer_id_application" \
   "$tool_root/package-macos-distribution.sh"
 /usr/bin/codesign --verify --verbose=2 "$dmg_path"
+/usr/sbin/pkgutil --check-signature "$installer_pkg_path"
 
 notary_profile="${NORMAN_NOTARY_PROFILE:-}"
 if [ -n "$notary_profile" ]; then
@@ -99,6 +102,6 @@ fi
 /usr/bin/xcrun stapler staple "$dmg_path"
 /usr/bin/xcrun stapler validate "$dmg_path"
 /usr/sbin/spctl --assess --type open --context context:primary-signature -vv "$dmg_path"
-/usr/bin/shasum -a 256 "$pkg_path" "$dmg_path"
+/usr/bin/shasum -a 256 "$installer_pkg_path" "$pkg_path" "$dmg_path"
 
 echo "Signed and notarized $dmg_path"

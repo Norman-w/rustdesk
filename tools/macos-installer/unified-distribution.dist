@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<installer-gui-script minSpecVersion="1">
+    <title>Norman Remote Desktop</title>
+    <welcome file="welcome.html" mime-type="text/html"/>
+    <options customize="always" require-scripts="false" hostArchitectures="x86_64,arm64"/>
+    <domains enable_anywhere="false" enable_currentUserHome="false" enable_localSystem="true"/>
+    <choices-outline>
+        <line choice="default">
+            <line choice="com.norman.remotedesktop.application"/>
+            <line choice="com.norman.remotedesktop.cm-helper.microphone"/>
+            <line choice="com.norman.remotedesktop.cm-helper.audio-output"/>
+            <line choice="com.norman.remotedesktop.application.finalize"/>
+        </line>
+    </choices-outline>
+    <choice id="default"/>
+    <choice id="com.norman.remotedesktop.application" visible="false"
+            title="Norman Remote Desktop 主程序和后台服务"
+            description="安装远程桌面管理界面和唯一的后台 service；这是必需组件。">
+        <pkg-ref id="com.norman.remotedesktop.application"/>
+    </choice>
+    <choice id="com.norman.remotedesktop.cm-helper.microphone" selected="true"
+            title="手机麦克风输入"
+            description="安装 Norman 手机麦克风 CoreAudio 输入设备，让手机语音可供 Mac 应用选择。">
+        <pkg-ref id="com.norman.remotedesktop.cm-helper.microphone"/>
+    </choice>
+    <choice id="com.norman.remotedesktop.cm-helper.audio-output" selected="true"
+            title="电脑声音虚拟输出"
+            description="安装 Norman Remote Audio 虚拟输出，供远程音频模式使用；不自动改变系统默认输出。">
+        <pkg-ref id="com.norman.remotedesktop.cm-helper.audio-output"/>
+    </choice>
+    <choice id="com.norman.remotedesktop.application.finalize" visible="false" selected="true"
+            title="完成安装">
+        <pkg-ref id="com.norman.remotedesktop.application.finalize"/>
+    </choice>
+    <pkg-ref id="com.norman.remotedesktop.application" version="__VERSION__" onConclusion="none">__APP_PACKAGE__</pkg-ref>
+    <pkg-ref id="com.norman.remotedesktop.cm-helper.microphone" version="__HELPER_VERSION__" onConclusion="none">__MICROPHONE_PACKAGE__</pkg-ref>
+    <pkg-ref id="com.norman.remotedesktop.cm-helper.audio-output" version="__HELPER_VERSION__" onConclusion="none">__AUDIO_OUTPUT_PACKAGE__</pkg-ref>
+    <pkg-ref id="com.norman.remotedesktop.application.finalize" version="__VERSION__" onConclusion="none">__FINALIZER_PACKAGE__</pkg-ref>
+</installer-gui-script>

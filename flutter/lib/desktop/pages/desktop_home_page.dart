@@ -497,8 +497,11 @@ class _DesktopHomePageState extends State<DesktopHomePage>
       }
     } else if (isMacOS) {
       final isOutgoingOnly = bind.isOutgoingOnly();
-      if (!isOutgoingOnly &&
-          (!_macTccReady() || !bind.mainIsNormanCmHelperInstalled())) {
+      // The CoreAudio components are optional installer choices.  They are
+      // only needed for microphone/system-audio routing, not for the core
+      // remote-control session, so never block the home screen when a user
+      // deliberately deselects them from the unified installer.
+      if (!isOutgoingOnly && !_macTccReady()) {
         return buildInstallCard(
             "macos_setup_guide_title", "macos_setup_guide_summary",
             "macos_setup_guide_open", () {

@@ -8,8 +8,14 @@ output_directory="${NORMAN_MACOS_OUTPUT_DIR:-$project_root/output}"
 version="${NORMAN_MACOS_VERSION:-1.5.0}"
 helper_version="${NORMAN_CM_HELPER_VERSION:-1.3.0}"
 helper_pkg_name="NormanRemoteDesktop-CMHelper-$helper_version.pkg"
+microphone_pkg_name="NormanRemoteDesktop-CMHelper-Microphone-$helper_version.pkg"
+audio_output_pkg_name="NormanRemoteDesktop-CMHelper-AudioOutput-$helper_version.pkg"
+installer_pkg_name="NormanRemoteDesktop-$version.pkg"
 app_path="${NORMAN_MACOS_APP_PATH:-$output_directory/NormanRemoteDesktop.app}"
 pkg_path="${NORMAN_CM_HELPER_PKG_PATH:-$output_directory/$helper_pkg_name}"
+installer_pkg_path="${NORMAN_MACOS_INSTALLER_PKG_PATH:-$output_directory/$installer_pkg_name}"
+microphone_pkg_path="$output_directory/$microphone_pkg_name"
+audio_output_pkg_path="$output_directory/$audio_output_pkg_name"
 dmg_path="${NORMAN_MACOS_DMG_PATH:-$output_directory/NormanRemoteDesktop-macOS-$version.dmg}"
 strict="${NORMAN_STRICT_DISTRIBUTION:-0}"
 
@@ -45,6 +51,9 @@ require_executable "$app_path/Contents/MacOS/service"
 require_file "$app_path/Contents/Frameworks/liblibrustdesk.dylib"
 require_file "$app_path/Contents/Resources/$helper_pkg_name"
 require_file "$pkg_path"
+require_file "$installer_pkg_path"
+require_file "$microphone_pkg_path"
+require_file "$audio_output_pkg_path"
 require_file "$dmg_path"
 if ! /usr/bin/cmp -s "$pkg_path" "$app_path/Contents/Resources/$helper_pkg_name"; then
   fail "embedded CM Helper pkg does not match the top-level helper package"
@@ -61,6 +70,13 @@ if /usr/bin/sed '/^[[:space:]]*#/d' "$postinstall_script" |
   fail "component installer must not create or start a persistent CM LaunchAgent"
 fi
 pass "component installer does not invoke TCC APIs or create a CM LaunchAgent"
+
+for package_name in "$microphone_pkg_name" "$audio_output_pkg_name"; do
+  /usr/bin/xar -tf "$installer_pkg_path" 2>/dev/null |
+    /usr/bin/grep -q -- "$package_name" ||
+    fail "unified installer does not contain $package_name"
+done
+pass "unified installer contains selectable audio component packages"
 
 bundle_identifier=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app_path/Contents/Info.plist" 2>/dev/null || true)
 bundle_display_name=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' "$app_path/Contents/Info.plist" 2>/dev/null || true)

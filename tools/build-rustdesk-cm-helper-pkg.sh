@@ -6,7 +6,26 @@ project_root="$(cd -- "$tool_root/.." && pwd)"
 output_directory="${NORMAN_CM_HELPER_OUTPUT_DIR:-$project_root/output}"
 macos_version="${NORMAN_MACOS_VERSION:-1.5.0}"
 package_version="${NORMAN_CM_HELPER_VERSION:-1.3.0}"
-package_path="$output_directory/NormanRemoteDesktop-CMHelper-$package_version.pkg"
+component="${NORMAN_CM_HELPER_COMPONENT:-all}"
+case "$component" in
+  all)
+    package_name="NormanRemoteDesktop-CMHelper-$package_version.pkg"
+    package_identifier="com.norman.remotedesktop.cm-helper"
+    ;;
+  microphone)
+    package_name="NormanRemoteDesktop-CMHelper-Microphone-$package_version.pkg"
+    package_identifier="com.norman.remotedesktop.cm-helper.microphone"
+    ;;
+  audio-output)
+    package_name="NormanRemoteDesktop-CMHelper-AudioOutput-$package_version.pkg"
+    package_identifier="com.norman.remotedesktop.cm-helper.audio-output"
+    ;;
+  *)
+    echo "NORMAN_CM_HELPER_COMPONENT must be all, microphone, or audio-output" >&2
+    exit 2
+    ;;
+esac
+package_path="$output_directory/$package_name"
 distribution_template="$tool_root/rustdesk-cm-helper/distribution.dist"
 installer_resources="$tool_root/rustdesk-cm-helper/installer-resources"
 app_path="${NORMAN_RUSTDESK_APP_PATH:-$project_root/output/NormanRemoteDesktop.app}"
@@ -29,7 +48,7 @@ for candidate in \
   fi
 done
 build_root="$(mktemp -d /tmp/norman-cm-helper-build.XXXXXX)"
-component_package_path="$build_root/NormanRemoteDesktop-CMHelper-component.pkg"
+component_package_path="$build_root/$package_name"
 distribution_path="$build_root/distribution.dist"
 package_scripts="$build_root/scripts"
 payload_root="$build_root/payload"
@@ -65,7 +84,8 @@ if ! "$app_executable" --tcc-status 2>/dev/null |
 fi
 
 /bin/mkdir -p "$package_scripts" "$support_root/bin" "$virtual_input_payload" "$virtual_input_source_payload" "$output_directory"
-/bin/cp "$tool_root/rustdesk-cm-helper/postinstall" "$package_scripts/postinstall"
+/usr/bin/sed "s/__COMPONENT__/$component/g" \
+  "$tool_root/rustdesk-cm-helper/postinstall" > "$package_scripts/postinstall"
 /bin/cp "$tool_root/rustdesk-cm-helper/run-cm-helper.sh" "$support_root/run-cm-helper.sh"
 /bin/cp "$tool_root/rustdesk-cm-helper/remote-mic-config.sh" "$support_root/remote-mic-config.sh"
 /bin/cp "$tool_root/rustdesk-cm-helper/audio-config-default.plist" "$support_root/audio-config-default.plist"
@@ -91,10 +111,14 @@ driver_build_output="$build_root/driver-output"
 NORMAN_REMOTE_MIC_DRIVER_OUTPUT_DIR="$driver_build_output" \
 NORMAN_CODESIGN_IDENTITY="$driver_signing_identity" \
   "$tool_root/mac-remote-mic/build-norman-remote-mic-driver.sh"
-/usr/bin/ditto --norsrc "$driver_build_output/NormanRemoteMic.driver" "$virtual_input_payload/NormanRemoteMic.driver"
-/usr/bin/ditto --norsrc "$driver_build_output/NormanRemoteAudio.driver" "$virtual_input_payload/NormanRemoteAudio.driver"
-/bin/chmod 755 "$virtual_input_payload/NormanRemoteMic.driver/Contents/MacOS/NormanRemoteMic"
-/bin/chmod 755 "$virtual_input_payload/NormanRemoteAudio.driver/Contents/MacOS/NormanRemoteAudio"
+if [ "$component" = all ] || [ "$component" = microphone ]; then
+  /usr/bin/ditto --norsrc "$driver_build_output/NormanRemoteMic.driver" "$virtual_input_payload/NormanRemoteMic.driver"
+  /bin/chmod 755 "$virtual_input_payload/NormanRemoteMic.driver/Contents/MacOS/NormanRemoteMic"
+fi
+if [ "$component" = all ] || [ "$component" = audio-output ]; then
+  /usr/bin/ditto --norsrc "$driver_build_output/NormanRemoteAudio.driver" "$virtual_input_payload/NormanRemoteAudio.driver"
+  /bin/chmod 755 "$virtual_input_payload/NormanRemoteAudio.driver/Contents/MacOS/NormanRemoteAudio"
+fi
 
 probe_source="$tool_root/mac-remote-mic/device_probe.c"
 probe_arm64="$build_root/device-probe-arm64"
@@ -127,7 +151,7 @@ if [ -n "${NORMAN_INSTALLER_SIGNING_IDENTITY:-}" ]; then
     --root "$payload_root" \
     --scripts "$package_scripts" \
     --ownership recommended \
-    --identifier com.norman.remotedesktop.cm-helper \
+    --identifier "$package_identifier" \
     --version "$package_version" \
     --sign "$NORMAN_INSTALLER_SIGNING_IDENTITY" \
     --install-location / \
@@ -137,33 +161,38 @@ else
     --root "$payload_root" \
     --scripts "$package_scripts" \
     --ownership recommended \
-    --identifier com.norman.remotedesktop.cm-helper \
+    --identifier "$package_identifier" \
     --version "$package_version" \
     --install-location / \
     "$component_package_path"
 fi
 
-/usr/bin/sed \
-  -e "s/__VERSION__/$package_version/g" \
-  -e "s/__COMPONENT_PACKAGE__/$(/usr/bin/basename "$component_package_path")/g" \
-  "$distribution_template" > "$distribution_path"
+if [ "$component" = all ]; then
+  /usr/bin/sed \
+    -e "s/__VERSION__/$package_version/g" \
+    -e "s/__COMPONENT_PACKAGE__/$(/usr/bin/basename "$component_package_path")/g" \
+    "$distribution_template" > "$distribution_path"
 
-if [ -n "${NORMAN_INSTALLER_SIGNING_IDENTITY:-}" ]; then
-  /usr/bin/productbuild \
-    --distribution "$distribution_path" \
-    --package-path "$build_root" \
-    --resources "$installer_resources" \
-    --sign "$NORMAN_INSTALLER_SIGNING_IDENTITY" \
-    --timestamp \
-    "$package_path"
-  package_signature="signed"
+  if [ -n "${NORMAN_INSTALLER_SIGNING_IDENTITY:-}" ]; then
+    /usr/bin/productbuild \
+      --distribution "$distribution_path" \
+      --package-path "$build_root" \
+      --resources "$installer_resources" \
+      --sign "$NORMAN_INSTALLER_SIGNING_IDENTITY" \
+      --timestamp \
+      "$package_path"
+    package_signature="signed"
+  else
+    /usr/bin/productbuild \
+      --distribution "$distribution_path" \
+      --package-path "$build_root" \
+      --resources "$installer_resources" \
+      "$package_path"
+    package_signature="unsigned"
+  fi
 else
-  /usr/bin/productbuild \
-    --distribution "$distribution_path" \
-    --package-path "$build_root" \
-    --resources "$installer_resources" \
-    "$package_path"
-  package_signature="unsigned"
+  /bin/mv "$component_package_path" "$package_path"
+  package_signature="component"
 fi
 
 /usr/sbin/pkgutil --check-signature "$package_path" 2>&1 || true
@@ -172,4 +201,5 @@ fi
 echo "Probe architecture: $probe_arch"
 echo "Driver signing identity: ${driver_signing_identity:-unsigned}"
 echo "Package signature: $package_signature"
+echo "Component selection: $component"
 echo "Built $package_path"

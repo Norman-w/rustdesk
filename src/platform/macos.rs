@@ -496,14 +496,19 @@ pub fn is_norman_cm_helper_installed() -> bool {
         .join("Contents/MacOS/NormanRemoteMic");
     let audio_driver = Path::new("/Library/Audio/Plug-Ins/HAL/NormanRemoteAudio.driver")
         .join("Contents/MacOS/NormanRemoteAudio");
+    let mic_driver_present = driver.is_file();
+    let audio_driver_present = audio_driver.is_file();
     let app_managed = helper_root.join("app-managed.marker").is_file()
         && helper_root.join("manifest.json").is_file()
         && helper_root.join("audio-config.plist").is_file()
         && helper_root
             .join("bin/norman-remote-mic-device-probe")
             .is_file()
-        && driver.is_file()
-        && audio_driver.is_file();
+        // The unified installer lets the user omit either optional HAL.  The
+        // marker therefore proves that the app-managed component package ran;
+        // requiring both drivers here would incorrectly report a deliberate
+        // microphone-only or audio-output-only installation as broken.
+        && (mic_driver_present || audio_driver_present);
     if app_managed {
         refresh_norman_audio_markers(&helper_root);
         return true;

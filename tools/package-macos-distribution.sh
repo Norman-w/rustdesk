@@ -7,15 +7,22 @@ output_directory="${NORMAN_MACOS_OUTPUT_DIR:-$project_root/output}"
 version="${NORMAN_MACOS_VERSION:-1.5.0}"
 helper_version="${NORMAN_CM_HELPER_VERSION:-1.3.0}"
 helper_pkg_name="NormanRemoteDesktop-CMHelper-$helper_version.pkg"
+microphone_pkg_name="NormanRemoteDesktop-CMHelper-Microphone-$helper_version.pkg"
+audio_output_pkg_name="NormanRemoteDesktop-CMHelper-AudioOutput-$helper_version.pkg"
+application_pkg_name="NormanRemoteDesktop-$version-application.pkg"
 installer_pkg_name="NormanRemoteDesktop-$version.pkg"
 app_path="${NORMAN_MACOS_APP_PATH:-$output_directory/NormanRemoteDesktop.app}"
 helper_pkg_path="${NORMAN_CM_HELPER_PKG_PATH:-$output_directory/$helper_pkg_name}"
+microphone_pkg_path="$output_directory/$microphone_pkg_name"
+audio_output_pkg_path="$output_directory/$audio_output_pkg_name"
+installer_pkg_path="$output_directory/$installer_pkg_name"
 volume_name="NormanRemoteDesktop-$version"
 staging_path="$output_directory/NormanRemoteDesktop-macOS-$version-staging"
 dmg_path="$output_directory/NormanRemoteDesktop-macOS-$version.dmg"
 readme_path="$staging_path/README.txt"
 checksums_path="$staging_path/SHA256SUMS.txt"
 installer_scripts_source="$tool_root/macos-installer"
+installer_resources="$tool_root/rustdesk-cm-helper/installer-resources"
 
 fail() {
   echo "error: $*" >&2
@@ -89,10 +96,28 @@ bundle_sodium_dependency() {
 require_dir "$app_path"
 require_file "$app_path/Contents/Info.plist"
 require_executable "$app_path/Contents/MacOS/NormanRemoteDesktop"
-require_file "$helper_pkg_path"
 require_file "$installer_scripts_source/preinstall"
 require_file "$installer_scripts_source/postinstall"
 require_dir "$app_path/Contents/Resources"
+
+build_component_package() {
+  component_name="$1"
+  NORMAN_CM_HELPER_OUTPUT_DIR="$output_directory" \
+  NORMAN_RUSTDESK_APP_PATH="$app_path" \
+  NORMAN_MACOS_VERSION="$version" \
+  NORMAN_CM_HELPER_VERSION="$helper_version" \
+  NORMAN_CM_HELPER_COMPONENT="$component_name" \
+    "$tool_root/build-rustdesk-cm-helper-pkg.sh"
+}
+
+if [ "${NORMAN_SKIP_COMPONENT_BUILD:-0}" != 1 ]; then
+  build_component_package all
+  build_component_package microphone
+  build_component_package audio-output
+fi
+require_file "$helper_pkg_path"
+require_file "$microphone_pkg_path"
+require_file "$audio_output_pkg_path"
 
 app_signing_identity="${NORMAN_APP_SIGNING_IDENTITY:-}"
 if [ -z "$app_signing_identity" ]; then
@@ -141,7 +166,6 @@ fi
 
 /bin/mkdir -p "$staging_path"
 /usr/bin/ditto "$app_path" "$staging_path/NormanRemoteDesktop.app"
-/bin/cp "$helper_pkg_path" "$staging_path/$helper_pkg_name"
 /bin/ln -s /Applications "$staging_path/Applications"
 
 installer_signing_identity="${NORMAN_INSTALLER_SIGNING_IDENTITY:-}"
@@ -152,7 +176,13 @@ if [ -z "$installer_signing_identity" ]; then
   )
 fi
 
-installer_pkg_path="$staging_path/$installer_pkg_name"
+installer_build_root="$(mktemp -d /tmp/norman-unified-installer.XXXXXX)"
+cleanup_installer_build() {
+  /bin/rm -rf "$installer_build_root"
+}
+trap cleanup_installer_build EXIT INT TERM
+
+application_pkg_path="$staging_path/$application_pkg_name"
 if [ -n "$installer_signing_identity" ]; then
   echo "Installer signing identity: $installer_signing_identity"
   /usr/bin/pkgbuild \
@@ -163,9 +193,9 @@ if [ -n "$installer_signing_identity" ]; then
     --version "$version" \
     --install-location /Applications \
     --sign "$installer_signing_identity" \
-    "$installer_pkg_path"
+    "$application_pkg_path"
 else
-  warn "no Developer ID Installer identity was found; the application PKG will be unsigned"
+  warn "no Developer ID Installer identity was found; the application component will be unsigned"
   /usr/bin/pkgbuild \
     --component "$staging_path/NormanRemoteDesktop.app" \
     --scripts "$installer_scripts_source" \
@@ -173,9 +203,72 @@ else
     --identifier com.norman.remotedesktop.application \
     --version "$version" \
     --install-location /Applications \
+    "$application_pkg_path"
+fi
+
+/bin/cp "$microphone_pkg_path" "$staging_path/$microphone_pkg_name"
+/bin/cp "$audio_output_pkg_path" "$staging_path/$audio_output_pkg_name"
+
+finalizer_payload="$installer_build_root/finalizer-payload"
+finalizer_scripts="$installer_build_root/finalizer-scripts"
+/bin/mkdir -p "$finalizer_payload" "$finalizer_scripts"
+/bin/cp "$installer_scripts_source/finalize-postinstall" "$finalizer_scripts/postinstall"
+/bin/chmod 755 "$finalizer_scripts/postinstall"
+if [ -n "$installer_signing_identity" ]; then
+  /usr/bin/pkgbuild \
+    --root "$finalizer_payload" \
+    --scripts "$finalizer_scripts" \
+    --ownership recommended \
+    --identifier com.norman.remotedesktop.application.finalize \
+    --version "$version" \
+    --install-location / \
+    --sign "$installer_signing_identity" \
+    "$installer_build_root/$version-finalizer.pkg"
+else
+  /usr/bin/pkgbuild \
+    --root "$finalizer_payload" \
+    --scripts "$finalizer_scripts" \
+    --ownership recommended \
+    --identifier com.norman.remotedesktop.application.finalize \
+    --version "$version" \
+    --install-location / \
+    "$installer_build_root/$version-finalizer.pkg"
+fi
+
+distribution_path="$installer_build_root/distribution.dist"
+/usr/bin/sed \
+  -e "s/__VERSION__/$version/g" \
+  -e "s/__HELPER_VERSION__/$helper_version/g" \
+  -e "s/__APP_PACKAGE__/$application_pkg_name/g" \
+  -e "s/__MICROPHONE_PACKAGE__/$microphone_pkg_name/g" \
+  -e "s/__AUDIO_OUTPUT_PACKAGE__/$audio_output_pkg_name/g" \
+  -e "s/__FINALIZER_PACKAGE__/$version-finalizer.pkg/g" \
+  "$installer_scripts_source/unified-distribution.dist" > "$distribution_path"
+
+if [ -e "$installer_pkg_path" ]; then
+  backup_installer="$installer_pkg_path.prev-$(/bin/date +%Y%m%d-%H%M%S)"
+  /bin/mv "$installer_pkg_path" "$backup_installer"
+fi
+if [ -n "$installer_signing_identity" ]; then
+  /usr/bin/productbuild \
+    --distribution "$distribution_path" \
+    --package-path "$staging_path" \
+    --package-path "$installer_build_root" \
+    --resources "$installer_resources" \
+    --sign "$installer_signing_identity" \
+    --timestamp \
+    "$installer_pkg_path"
+else
+  /usr/bin/productbuild \
+    --distribution "$distribution_path" \
+    --package-path "$staging_path" \
+    --package-path "$installer_build_root" \
+    --resources "$installer_resources" \
     "$installer_pkg_path"
 fi
 installer_signature=$(/usr/sbin/pkgutil --check-signature "$installer_pkg_path" 2>&1 || true)
+/bin/cp "$installer_pkg_path" "$staging_path/$installer_pkg_name"
+/bin/rm -f "$application_pkg_path" "$staging_path/$microphone_pkg_name" "$staging_path/$audio_output_pkg_name"
 
 /bin/cat > "$readme_path" <<README
 Norman Remote Desktop $version for macOS
@@ -183,17 +276,16 @@ Norman Remote Desktop $version for macOS
 This disk image contains:
 
 1. $installer_pkg_name
-   This is the recommended installation path. macOS Installer closes the old app,
-   replaces the copy in Applications, removes only this app's downloaded-file
-   quarantine flag, and opens the new app after installation.
+   This is the recommended installation path. The installer closes the old app,
+   replaces the copy in Applications, and lets you choose optional components:
+   Norman 手机麦克风 and Norman Remote Audio virtual output. It opens the
+   management UI only after all selected components finish.
 
 2. NormanRemoteDesktop.app
    The app is also available for manual drag-and-drop installation.
 
-3. $helper_pkg_name
-   The same helper package is also bundled inside the app. The app will offer to
-   open it when controlled-side components are missing. You can run this copy
-   manually if needed.
+The legacy component package is embedded inside the app for repair/compatibility;
+normal installation should use the single product PKG above.
 
 Expected first-run flow:
 
@@ -201,13 +293,11 @@ Expected first-run flow:
 2. The app checks macOS Screen & System Audio Recording, Accessibility, and Input Monitoring permissions.
 3. Use the app's permission / repair flow when prompted.
 4. After the permissions are ready, the app restarts itself once so macOS applies TCC permissions to the active process.
-5. The app checks the controlled-side components. If the virtual microphone is
-   missing, install the bundled package when prompted by the app. The package
-   installs only the Norman virtual microphone HAL and app-managed audio data;
-   the app/service owns connection management and does not create a persistent
-   CM LaunchAgent.
+5. The selected optional components install only their CoreAudio HAL devices and
+   app-managed audio state; the app/service owns connection management and does
+   not create a persistent CM LaunchAgent.
 6. The mobile client can connect and receive the desktop video stream,
-   keyboard/mouse control, and helper-backed audio features when installed.
+   keyboard/mouse control, and any selected audio features.
 7. In NormanRemoteDesktop settings, choose Remote audio output:
    Computer speakers and phone keeps local playback and sends a ScreenCaptureKit
    copy to the phone. Norman Remote Audio virtual output temporarily routes Mac
@@ -223,7 +313,7 @@ Verification notes from packaging:
 - Bundle id: $bundle_identifier
 - Version: $bundle_version
 - TCC API status: $tcc_status
-- Application installer signature:
+- Unified installer signature:
 $installer_signature
 - Helper package signature:
 $helper_signature
@@ -245,7 +335,7 @@ README
 
 (
   cd "$staging_path"
-  /usr/bin/shasum -a 256 "$installer_pkg_name" "$helper_pkg_name" > "$checksums_path"
+  /usr/bin/shasum -a 256 "$installer_pkg_name" > "$checksums_path"
   /usr/bin/shasum -a 256 \
 	    NormanRemoteDesktop.app/Contents/MacOS/NormanRemoteDesktop \
 	    NormanRemoteDesktop.app/Contents/MacOS/service \

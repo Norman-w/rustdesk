@@ -1,0 +1,20 @@
+#!/bin/sh
+set -eu
+
+app_path="/Applications/NormanRemoteDesktop.app"
+bundle_identifier=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \
+  "$app_path/Contents/Info.plist" 2>/dev/null || true)
+if [ "$bundle_identifier" != "com.carriez.NormanRemoteDesktop" ]; then
+  echo "The unified installer did not leave the expected NormanRemoteDesktop app." >&2
+  exit 1
+fi
+
+console_user=$(/usr/bin/stat -f '%Su' /dev/console 2>/dev/null || printf 'root')
+if [ "$console_user" != "root" ] && [ "$console_user" != "loginwindow" ]; then
+  console_uid=$(/usr/bin/id -u "$console_user" 2>/dev/null || true)
+  if [ -n "$console_uid" ]; then
+    /bin/launchctl asuser "$console_uid" /usr/bin/open "$app_path" >/dev/null 2>&1 || true
+  fi
+fi
+
+echo "Norman Remote Desktop unified installation complete."

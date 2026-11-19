@@ -373,7 +373,10 @@ class _MacosSetupGuidePageState extends State<MacosSetupGuidePage>
             Row(
               children: [
                 OutlinedButton.icon(
-                  onPressed: _tccReady && _componentsReady
+                  // The HAL choices are optional.  Restarting after TCC is
+                  // granted must remain available even when the user omitted
+                  // both audio components from the unified installer.
+                  onPressed: _tccReady
                       ? () => bind.mainRelaunchApp()
                       : null,
                   icon: const Icon(Icons.restart_alt),
