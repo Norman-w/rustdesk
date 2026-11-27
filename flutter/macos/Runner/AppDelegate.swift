@@ -6,6 +6,12 @@ class AppDelegate: FlutterAppDelegate {
     var launched = false;
     private var terminationWasRequested = false;
 
+  private var isConnectionManagerLaunch: Bool {
+      CommandLine.arguments.dropFirst().contains { argument in
+          argument == "--cm" || argument == "--cm-no-ui"
+      }
+  }
+
   override func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
       // RustDesk keeps its connection manager alive while its main window is
       // hidden. AppKit may otherwise treat the window-less menu-bar process as
@@ -70,6 +76,12 @@ class AppDelegate: FlutterAppDelegate {
         // without a visible window. Keep AppKit from terminating the process
         // during those periods while the tray/IPC service is still active.
         ProcessInfo.processInfo.disableAutomaticTermination("RustDesk menu bar service")
-        NSApplication.shared.activate(ignoringOtherApps: true);
+        // A hidden connection manager is started by --server in the user's
+        // session. Activating it here moves the user to RustDesk's Space even
+        // though its window is immediately hidden. The visible management UI
+        // still explicitly focuses itself from Dart when the user opens it.
+        if !isConnectionManagerLaunch {
+            NSApplication.shared.activate(ignoringOtherApps: true)
+        }
     }
 }

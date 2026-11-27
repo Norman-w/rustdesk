@@ -350,14 +350,15 @@ hideCmWindow({bool isStartup = false}) async {
     windowManager.setOpacity(0);
     await windowManager.waitUntilReadyToShow(windowOptions, null);
     bind.mainHideDock();
-    await windowManager.minimize();
+    // Do not miniaturize a never-visible hidden CM window. On macOS AppKit may
+    // briefly activate the window's Space while processing miniaturize, which
+    // defeats the point of the headless connection manager.
     await windowManager.hide();
     _isCmReadyToShow = true;
   } else if (_isCmReadyToShow) {
     if (await windowManager.getOpacity() != 0) {
       await windowManager.setOpacity(0);
       bind.mainHideDock();
-      await windowManager.minimize();
       await windowManager.hide();
     }
   }
