@@ -193,6 +193,8 @@ static UInt64								gDevice_AnchorHostTime			= 0;
 static Float32                                gDevice_RingBuffer[16384][2];
 static _Atomic UInt64                         gDevice_RingWriteFrame = 0;
 static _Atomic UInt64                         gDevice_RingReadFrame = 0;
+// Temporary host-side diagnostics for validating the output->input loopback.
+// These counters are intentionally process-local and do not retain samples.
 
 static bool									gStream_Input_IsActive			= true;
 static bool									gStream_Output_IsActive			= true;
@@ -225,7 +227,6 @@ static void NormanRemoteMic_WriteFrames(const Float32* input, UInt32 frame_count
 	if (input == NULL || frame_count == 0) {
 		return;
 	}
-
 	UInt64 write_frame = atomic_load_explicit(&gDevice_RingWriteFrame, memory_order_relaxed);
 	UInt64 read_frame = atomic_load_explicit(&gDevice_RingReadFrame, memory_order_acquire);
 	for (UInt32 frame = 0; frame < frame_count; ++frame) {
@@ -246,7 +247,6 @@ static void NormanRemoteMic_ReadFrames(Float32* output, UInt32 frame_count)
 	if (output == NULL || frame_count == 0) {
 		return;
 	}
-
 	UInt64 write_frame = atomic_load_explicit(&gDevice_RingWriteFrame, memory_order_acquire);
 	UInt64 read_frame = atomic_load_explicit(&gDevice_RingReadFrame, memory_order_relaxed);
 	if (write_frame - read_frame > 16384) {
@@ -534,7 +534,7 @@ static OSStatus	NullAudio_Initialize(AudioServerPlugInDriverRef inDriver, AudioS
 	//	calculate the host ticks per frame
 	struct mach_timebase_info theTimeBaseInfo;
 	mach_timebase_info(&theTimeBaseInfo);
-	Float64 theHostClockFrequency = (Float64)theTimeBaseInfo.numer / (Float64)theTimeBaseInfo.denom;
+	Float64 theHostClockFrequency = (Float64)theTimeBaseInfo.denom / (Float64)theTimeBaseInfo.numer;
 	theHostClockFrequency *= 1000000000.0;
 	gDevice_HostTicksPerFrame = theHostClockFrequency / gDevice_SampleRate;
 	
@@ -653,7 +653,7 @@ static OSStatus	NullAudio_PerformDeviceConfigurationChange(AudioServerPlugInDriv
 	//	recalculate the state that depends on the sample rate
 	struct mach_timebase_info theTimeBaseInfo;
 	mach_timebase_info(&theTimeBaseInfo);
-    Float64 theHostClockFrequency = (Float64)theTimeBaseInfo.numer / (Float64)theTimeBaseInfo.denom;
+	Float64 theHostClockFrequency = (Float64)theTimeBaseInfo.denom / (Float64)theTimeBaseInfo.numer;
 	theHostClockFrequency *= 1000000000.0;
 	gDevice_HostTicksPerFrame = theHostClockFrequency / gDevice_SampleRate;
 
