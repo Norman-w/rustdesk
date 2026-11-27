@@ -60,7 +60,7 @@ git submodule update --init --recursive
 只构建 HAL 时运行 `tools/mac-remote-mic/build-norman-remote-mic-driver.sh`。
 这些构建命令不会安装、结束现有进程或替换 Applications 中的应用。
 
-推荐安装产物是 `NormanRemoteDesktop-1.5.0.pkg`，这是一个可自定义的总安装包：
+推荐安装产物是 `NormanRemoteDesktop-1.5.4.pkg`，这是一个可自定义的总安装包：
 
 - 主程序和唯一后台 service 始终安装；
 - “手机麦克风输入”可选，安装 `Norman 手机麦克风` CoreAudio 输入设备；

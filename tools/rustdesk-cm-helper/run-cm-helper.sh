@@ -259,7 +259,7 @@ write_state() {
   /bin/mv -f "$temporary" "$heartbeat"
   temporary="$manifest.tmp.$$"
   /usr/bin/printf '%s\n' \
-    "{\"schemaVersion\":3,\"state\":\"$cm_state\",\"helperKind\":\"norman-remotedesktop-cm-no-ui\",\"helperVersion\":\"$helper_version\",\"baseBundleIdentifier\":\"com.carriez.NormanRemoteDesktop\",\"baseVersion\":\"1.5.0\",\"launchAgentLabel\":\"$agent_label\",\"purpose\":\"Keep NormanRemoteDesktop connection management headless so full-screen applications and Spaces keep focus.\",\"components\":{\"cm\":{\"state\":\"$cm_state\"},\"audio\":{\"state\":\"$audio_state\",\"route\":\"$audio_route\",\"virtualInput\":\"$virtual_input_state\",\"otherAppsInput\":\"$other_apps_input\"},\"tcc\":{\"state\":\"$tcc_state\",\"screenRecording\":$tcc_screen_recording,\"accessibility\":$tcc_accessibility,\"inputMonitoring\":$tcc_input_monitoring}}}" \
+    "{\"schemaVersion\":3,\"state\":\"$cm_state\",\"helperKind\":\"norman-remotedesktop-cm-no-ui\",\"helperVersion\":\"$helper_version\",\"baseBundleIdentifier\":\"com.carriez.NormanRemoteDesktop\",\"baseVersion\":\"1.5.4\",\"launchAgentLabel\":\"$agent_label\",\"purpose\":\"Keep NormanRemoteDesktop connection management headless so full-screen applications and Spaces keep focus.\",\"components\":{\"cm\":{\"state\":\"$cm_state\"},\"audio\":{\"state\":\"$audio_state\",\"route\":\"$audio_route\",\"virtualInput\":\"$virtual_input_state\",\"otherAppsInput\":\"$other_apps_input\"},\"tcc\":{\"state\":\"$tcc_state\",\"screenRecording\":$tcc_screen_recording,\"accessibility\":$tcc_accessibility,\"inputMonitoring\":$tcc_input_monitoring}}}" \
     > "$temporary"
   /bin/mv -f "$temporary" "$manifest"
 }

@@ -4,7 +4,7 @@ set -eu
 tool_root="$(cd -- "$(dirname -- "$0")" && pwd)"
 project_root="$(cd -- "$tool_root/.." && pwd)"
 output_directory="${NORMAN_MACOS_OUTPUT_DIR:-$project_root/output}"
-version="${NORMAN_MACOS_VERSION:-1.5.0}"
+version="${NORMAN_MACOS_VERSION:-1.5.4}"
 helper_version="${NORMAN_CM_HELPER_VERSION:-1.3.0}"
 helper_pkg_name="NormanRemoteDesktop-CMHelper-$helper_version.pkg"
 microphone_pkg_name="NormanRemoteDesktop-CMHelper-Microphone-$helper_version.pkg"

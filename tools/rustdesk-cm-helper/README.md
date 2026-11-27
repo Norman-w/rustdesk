@@ -3,7 +3,7 @@
 This package is the single macOS-side component for the two related remote
 control needs:
 
-- the NormanRemoteDesktop 1.5.0 app-managed connection manager, which uses the
+- the NormanRemoteDesktop 1.5.4 app-managed connection manager, which uses the
   official on-demand `--cm` path and the app's hidden-window setting so a
   full-screen application or Space is not pulled away when a session starts;
 - two user-space CoreAudio HAL plug-ins: `Norman 手机麦克风` for the phone
@@ -24,7 +24,7 @@ mix physical microphone or speaker audio.
 The package is deliberately limited to the existing NormanRemoteDesktop bundle:
 
 - Bundle ID: `com.carriez.NormanRemoteDesktop`
-- Version: `1.5.0`
+- Version: `1.5.4`
 - Entry point: `/Applications/NormanRemoteDesktop.app/Contents/MacOS/NormanRemoteDesktop`
 - Persistent LaunchAgent: none; the app/service owns CM lifecycle
 - Package version: `1.3.0`

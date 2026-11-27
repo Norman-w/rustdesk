@@ -4,7 +4,7 @@ set -eu
 tool_root="$(cd -- "$(dirname -- "$0")" && pwd)"
 project_root="$(cd -- "$tool_root/.." && pwd)"
 output_directory="${NORMAN_CM_HELPER_OUTPUT_DIR:-$project_root/output}"
-macos_version="${NORMAN_MACOS_VERSION:-1.5.0}"
+macos_version="${NORMAN_MACOS_VERSION:-1.5.4}"
 package_version="${NORMAN_CM_HELPER_VERSION:-1.3.0}"
 component="${NORMAN_CM_HELPER_COMPONENT:-all}"
 case "$component" in
