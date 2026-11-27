@@ -286,6 +286,68 @@ AudioDeviceID find_remote_audio_output(const char *requested_name) {
     return result;
 }
 
+// Return the first usable output device other than the Norman virtual sink.
+// This is only used to recover a stale route left behind when the process was
+// terminated while the virtual-output mode owned the system default. It does
+// not change anything by itself; the caller decides when recovery is safe.
+AudioDeviceID find_non_remote_audio_output(AudioDeviceID excluded) {
+    const auto devices_address = remote_mic_property_address(
+        kAudioHardwarePropertyDevices,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain);
+    UInt32 data_size = 0;
+    if (AudioObjectGetPropertyDataSize(
+            kAudioObjectSystemObject, &devices_address, 0, nullptr, &data_size) != noErr ||
+        data_size < sizeof(AudioDeviceID)) {
+        return kAudioObjectUnknown;
+    }
+
+    std::vector<AudioDeviceID> devices(data_size / sizeof(AudioDeviceID));
+    if (AudioObjectGetPropertyData(
+            kAudioObjectSystemObject,
+            &devices_address,
+            0,
+            nullptr,
+            &data_size,
+            devices.data()) != noErr) {
+        return kAudioObjectUnknown;
+    }
+
+    const auto output_stream_address = remote_mic_property_address(
+        kAudioDevicePropertyStreamConfiguration,
+        kAudioObjectPropertyScopeOutput,
+        kAudioObjectPropertyElementMain);
+    for (AudioDeviceID device : devices) {
+        if (device == excluded) {
+            continue;
+        }
+        UInt32 stream_size = 0;
+        if (AudioObjectGetPropertyDataSize(
+                device, &output_stream_address, 0, nullptr, &stream_size) != noErr ||
+            stream_size < sizeof(AudioBufferList)) {
+            continue;
+        }
+        std::vector<UInt32> storage(
+            (stream_size + sizeof(UInt32) - 1) / sizeof(UInt32));
+        auto *buffers = reinterpret_cast<AudioBufferList *>(storage.data());
+        if (AudioObjectGetPropertyData(
+                device,
+                &output_stream_address,
+                0,
+                nullptr,
+                &stream_size,
+                buffers) != noErr) {
+            continue;
+        }
+        for (UInt32 i = 0; i < buffers->mNumberBuffers; ++i) {
+            if (buffers->mBuffers[i].mNumberChannels > 0) {
+                return device;
+            }
+        }
+    }
+    return kAudioObjectUnknown;
+}
+
 bool get_default_remote_audio_output(AudioDeviceID *device) {
     if (device == nullptr) {
         return false;
@@ -462,6 +524,48 @@ extern "C" bool MacEnsureRemoteAudioRoute(const char *requested_name) {
     }
     if (target != current_system_output && !set_default_remote_system_output(target)) {
         ok = false;
+    }
+    return ok;
+}
+
+extern "C" bool MacRecoverStaleRemoteAudioRoute(const char *requested_name) {
+    std::lock_guard<std::mutex> lock(g_remote_audio_route_mutex);
+    if (g_remote_audio_route_users > 0) {
+        return false;
+    }
+
+    AudioDeviceID target = find_remote_audio_output(requested_name);
+    if (target == kAudioObjectUnknown) {
+        return false;
+    }
+
+    AudioDeviceID current_output = kAudioObjectUnknown;
+    AudioDeviceID current_system_output = kAudioObjectUnknown;
+    if (!get_default_remote_audio_output(&current_output) ||
+        !get_default_remote_system_output(&current_system_output)) {
+        return false;
+    }
+
+    // Nothing was left behind by a previous process.
+    if (current_output != target && current_system_output != target) {
+        return true;
+    }
+
+    AudioDeviceID fallback = find_non_remote_audio_output(target);
+    if (fallback == kAudioObjectUnknown) {
+        NSLog(@"Unable to find a physical output while recovering stale Norman Remote Audio route");
+        return false;
+    }
+
+    bool ok = true;
+    if (current_output == target && !set_default_remote_audio_output(fallback)) {
+        ok = false;
+    }
+    if (current_system_output == target && !set_default_remote_system_output(fallback)) {
+        ok = false;
+    }
+    if (ok) {
+        NSLog(@"Recovered stale Norman Remote Audio route to the physical output");
     }
     return ok;
 }

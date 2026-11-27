@@ -17,8 +17,11 @@ test('macOS implementation is compiled source, not a packaging patch', () => {
   assert.match(read('src/client.rs'), /drop\(self\.audio_stream\.take\(\)\)/);
   assert.match(read('src/server/connection.rs'), /drop\(std::mem::replace\(&mut self\.audio_sender, None\)\)/);
   assert.match(read('src/server/audio_service.rs'), /pub fn refresh_remote_audio_route/);
+  assert.match(read('src/server/audio_service.rs'), /MAC_AUDIO_ROUTE_EXPLICIT_OPTION/);
+  assert.match(read('src/server/audio_service.rs'), /recover_stale_remote_audio_route/);
   assert.match(read('src/server/audio_service.rs'), /HOST_SCREEN_CAPTURE_KIT/);
   assert.match(read('src/platform/macos.mm'), /MacBeginRemoteAudioRoute/);
+  assert.match(read('src/platform/macos.mm'), /MacRecoverStaleRemoteAudioRoute/);
   assert.match(read('src/platform/macos.mm'), /MacEndRemoteAudioRoute/);
   assert.equal(filesIn('tools').filter((file) => file.endsWith('.patch')).length, 0);
 });

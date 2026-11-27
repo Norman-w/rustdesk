@@ -82,7 +82,16 @@ Choose the mode in the NormanRemoteDesktop settings page:
   audio while the current speakers/headphones continue to play normally.
 - `Norman Remote Audio virtual output` temporarily routes the Mac default
   output and system-output devices to the installed virtual output. The app
-  restores the saved devices when the remote audio subscription ends.
+  restores the saved devices when the remote audio subscription ends. This is
+  an explicit opt-in mode; while it is active, changing the macOS output to
+  Mac speakers is intentionally rejected so the phone stream cannot silently
+  become empty. The normal `Computer speakers and phone` mode keeps the
+  selected Mac output and mirrors it through ScreenCaptureKit.
+
+Upgraded installations from the pre-opt-in implementation may contain a
+`mac-audio-route = virtual-output` value without an explicit selection marker.
+Those values are treated as the safe `Computer speakers and phone` mode and a
+stale virtual default output is recovered on service startup.
 
 The installer does not select either default device. The second mode requires
 CoreAudio to have loaded `NormanRemoteAudio.driver`.

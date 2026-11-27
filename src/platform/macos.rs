@@ -104,6 +104,7 @@ extern "C" {
     fn MacEndRemoteMicRoute();
     fn MacBeginRemoteAudioRoute(requested_name: *const std::os::raw::c_char) -> bool;
     fn MacEnsureRemoteAudioRoute(requested_name: *const std::os::raw::c_char) -> bool;
+    fn MacRecoverStaleRemoteAudioRoute(requested_name: *const std::os::raw::c_char) -> bool;
     fn MacEndRemoteAudioRoute();
 }
 
@@ -139,6 +140,15 @@ pub fn ensure_remote_audio_route(device_name: &str) -> bool {
         return false;
     };
     unsafe { MacEnsureRemoteAudioRoute(device_name.as_ptr()) }
+}
+
+/// Recover a virtual output left selected after an interrupted process.
+pub fn recover_stale_remote_audio_route(device_name: &str) -> bool {
+    let Ok(device_name) = CString::new(device_name) else {
+        log::warn!("Cannot recover stale remote audio route: device name contains a NUL byte");
+        return false;
+    };
+    unsafe { MacRecoverStaleRemoteAudioRoute(device_name.as_ptr()) }
 }
 
 /// Restore the macOS outputs that were active before the remote audio session.

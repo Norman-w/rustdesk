@@ -165,7 +165,16 @@ pub fn get_option<T: AsRef<str>>(key: T) -> String {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
         let map = OPTIONS.lock().unwrap();
-        if let Some(v) = map.get(key.as_ref()) {
+        if key.as_ref() == "mac-audio-route"
+            && map.get("mac-audio-route").map(String::as_str) == Some("virtual-output")
+            && map.get("mac-audio-route-explicit").map(String::as_str) != Some("Y")
+        {
+            // Legacy installs did not persist an explicit opt-in marker. Keep
+            // the UI aligned with the safe effective behavior used by the
+            // server: ScreenCaptureKit mirrors audio while Mac speakers stay
+            // selectable.
+            "system".to_owned()
+        } else if let Some(v) = map.get(key.as_ref()) {
             v.to_owned()
         } else {
             "".to_owned()
@@ -453,8 +462,21 @@ pub fn set_option(key: String, value: String) {
         let mut options = OPTIONS.lock().unwrap();
         if value.is_empty() {
             options.remove(&key);
+            if key == "mac-audio-route" {
+                options.remove("mac-audio-route-explicit");
+            }
         } else {
             options.insert(key.clone(), value.clone());
+            if key == "mac-audio-route" {
+                if value == "virtual-output" {
+                    // Only an explicit UI selection opts into the mode that
+                    // owns the system output. This marker lets upgraded
+                    // installs safely migrate legacy virtual-output values.
+                    options.insert("mac-audio-route-explicit".to_owned(), "Y".to_owned());
+                } else {
+                    options.remove("mac-audio-route-explicit");
+                }
+            }
         }
         ipc::set_options(options.clone()).ok();
     }

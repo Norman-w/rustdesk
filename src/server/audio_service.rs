@@ -30,15 +30,34 @@ lazy_static::lazy_static! {
 
 #[cfg(target_os = "macos")]
 pub const NORMAN_REMOTE_AUDIO_OUTPUT_DEVICE: &str = "Norman Remote Audio";
+#[cfg(target_os = "macos")]
+const MAC_AUDIO_ROUTE_EXPLICIT_OPTION: &str = "mac-audio-route-explicit";
 
 #[cfg(target_os = "macos")]
 static REMOTE_AUDIO_SUBSCRIBERS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(target_os = "macos")]
 static REMOTE_AUDIO_ROUTE_ACTIVE: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "macos")]
+static REMOTE_AUDIO_ROUTE_RECOVERY_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(target_os = "macos")]
 pub fn remote_audio_route_is_virtual() -> bool {
+    // Older builds wrote `virtual-output` without recording that the user had
+    // explicitly opted into a mode that takes over the macOS default output.
+    // Treat that legacy value as the safe speakers+phone mode instead of
+    // silently reclaiming the user's speakers on every audio-service tick.
     Config::get_option("mac-audio-route") == "virtual-output"
+        && Config::get_option(MAC_AUDIO_ROUTE_EXPLICIT_OPTION) == "Y"
+}
+
+#[cfg(target_os = "macos")]
+fn recover_stale_remote_audio_route() {
+    if REMOTE_AUDIO_ROUTE_RECOVERY_ATTEMPTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    if crate::platform::recover_stale_remote_audio_route(NORMAN_REMOTE_AUDIO_OUTPUT_DEVICE) {
+        log::info!("Checked for a stale Norman Remote Audio default-output route");
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -69,6 +88,12 @@ pub fn refresh_remote_audio_route() {
         crate::platform::end_remote_audio_route();
         REMOTE_AUDIO_ROUTE_ACTIVE.store(false, Ordering::SeqCst);
         log::info!("Norman system audio route restored");
+    } else if !should_route && !route_active && !remote_audio_route_is_virtual() {
+        // A force-quit or crash can leave CoreAudio pointing at the virtual
+        // sink even though the in-process route state was lost. Recover it
+        // once at service startup; never do this for an explicit virtual-
+        // output selection.
+        recover_stale_remote_audio_route();
     }
 }
 
