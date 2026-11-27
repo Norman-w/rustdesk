@@ -660,6 +660,13 @@ pub async fn start_server(is_server: bool, no_server: bool) {
         }
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         wait_initial_config_sync().await;
+        #[cfg(target_os = "macos")]
+        if let Err(err) = crate::server::ensure_connection_manager().await {
+            // The per-connection path retries CM startup, so a transient
+            // launch or permission failure must not prevent the host server
+            // from registering and accepting sessions.
+            log::warn!("failed to start macOS connection manager: {}", err);
+        }
         #[cfg(target_os = "windows")]
         crate::platform::try_kill_broker();
         #[cfg(feature = "hwcodec")]
@@ -913,11 +920,13 @@ pub fn stop_main_window_process_without_relaunch() {
     let current_pid = hbb_common::sysinfo::Pid::from_u32(std::process::id());
     let mut system = System::new();
     system.refresh_processes();
+    let mut targets = Vec::new();
 
     for process in system.processes().values() {
-        if process.pid() == current_pid
-            || process.cmd().get(1).map_or(true, |arg| arg != "--server")
-        {
+        let Some(arg) = process.cmd().get(1).map(String::as_str) else {
+            continue;
+        };
+        if process.pid() == current_pid || !matches!(arg, "--server" | "--cm" | "--cm-no-ui") {
             continue;
         }
         let Ok(process_exe) = std::fs::canonicalize(process.exe()) else {
@@ -926,11 +935,36 @@ pub fn stop_main_window_process_without_relaunch() {
         if process_exe != current_exe {
             continue;
         }
+        // Stop hidden CM children before their --server parent, otherwise a
+        // child can survive an explicit UI quit and become a duplicate on the
+        // next launch.
+        targets.push((process.pid(), arg == "--server"));
+    }
+    targets.sort_by_key(|(_, is_server)| *is_server);
+
+    for (pid, is_server) in targets {
+        let Some(process) = system.process(pid) else {
+            continue;
+        };
         match process.kill_with(Signal::Term) {
-            Some(true) => log::info!("stopped macOS host service pid {}", process.pid()),
-            Some(false) | None => {
-                log::warn!("failed to stop macOS host service pid {}", process.pid())
-            }
+            Some(true) => log::info!(
+                "stopped macOS {} pid {}",
+                if is_server {
+                    "host service"
+                } else {
+                    "connection manager"
+                },
+                pid
+            ),
+            Some(false) | None => log::warn!(
+                "failed to stop macOS {} pid {}",
+                if is_server {
+                    "host service"
+                } else {
+                    "connection manager"
+                },
+                pid
+            ),
         }
     }
 }

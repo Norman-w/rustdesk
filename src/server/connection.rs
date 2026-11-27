@@ -58,6 +58,8 @@ use serde_derive::Serialize;
 use serde_json::{json, value::Value};
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use std::sync::atomic::Ordering;
+#[cfg(target_os = "macos")]
+use std::sync::atomic::AtomicBool;
 use std::{
     collections::HashSet,
     net::Ipv6Addr,
@@ -92,6 +94,9 @@ lazy_static::lazy_static! {
     static ref WAKELOCK_SENDER: Arc::<Mutex<std::sync::mpsc::Sender<(usize, usize)>>> = Arc::new(Mutex::new(start_wakelock_thread()));
     static ref WAKELOCK_KEEP_AWAKE_OPTION: Arc::<Mutex<Option<bool>>> = Default::default();
 }
+
+#[cfg(target_os = "macos")]
+static CM_START_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
 #[cfg(feature = "flutter")]
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -6394,9 +6399,73 @@ pub fn claim_pending_switch_sides_uuid(id: &str, uuid: &uuid::Uuid) -> bool {
     false
 }
 
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
 // IPC bootstrap summary:
 // - Start CM when missing, then bridge bidirectional messages between this task and CM IPC.
+#[cfg(target_os = "macos")]
+fn connection_manager_args() -> Vec<&'static str> {
+    if hbb_common::password_security::approve_mode()
+        == hbb_common::password_security::ApproveMode::Password
+    {
+        vec!["--cm-no-ui"]
+    } else {
+        vec!["--cm"]
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn wait_for_connection_manager() -> ResultType<()> {
+    for _ in 0..20 {
+        if ipc::connect(1000, "_cm").await.is_ok() {
+            return Ok(());
+        }
+        sleep(0.3).await;
+    }
+    bail!("Failed to connect to connection manager");
+}
+
+/// Ensure the user-session server has one connection-manager process.
+///
+/// The CM is an internal mode of this same executable, not a second installed
+/// application. It is started by `--server` so the first incoming connection
+/// does not have to race CM startup. The per-connection path still calls this
+/// function as a recovery path if CM was closed or crashed.
+#[cfg(target_os = "macos")]
+pub(crate) async fn ensure_connection_manager() -> ResultType<()> {
+    if ipc::connect(1000, "_cm").await.is_ok() {
+        return Ok(());
+    }
+
+    let args = connection_manager_args();
+    let owns_start = !CM_START_IN_FLIGHT.swap(true, Ordering::SeqCst);
+    if owns_start {
+        let already_running = crate::check_process(&args[0], true);
+        if !already_running {
+            let spawn_result = if crate::platform::is_root() {
+                crate::platform::run_as_user(args.clone()).map(|task| {
+                    if let Some(task) = task {
+                        super::CHILD_PROCESS.lock().unwrap().push(task);
+                    }
+                })
+            } else {
+                crate::run_me(args).map(|task| {
+                    super::CHILD_PROCESS.lock().unwrap().push(task);
+                })
+                .map_err(Into::into)
+            };
+            if let Err(err) = spawn_result {
+                CM_START_IN_FLIGHT.store(false, Ordering::SeqCst);
+                return Err(err);
+            }
+        }
+    }
+
+    let result = wait_for_connection_manager().await;
+    if owns_start {
+        CM_START_IN_FLIGHT.store(false, Ordering::SeqCst);
+    }
+    result
+}
+
 async fn start_ipc(
     mut rx_to_cm: mpsc::UnboundedReceiver<ipc::Data>,
     tx_from_cm: mpsc::UnboundedSender<ipc::Data>,
@@ -6414,57 +6483,56 @@ async fn start_ipc(
         stream = Some(s);
     }
     if stream.is_none() {
-        // A password-authenticated macOS session does not need an approval
-        // window. Starting a second Flutter NSApplication for the CM can
-        // tear down inside CVDisplayLink before the video session is
-        // authorized, leaving the peer connected but waiting for video.
-        let args = if cfg!(target_os = "macos")
-            && hbb_common::password_security::approve_mode()
-                == hbb_common::password_security::ApproveMode::Password
+        #[cfg(target_os = "macos")]
         {
-            vec!["--cm-no-ui"]
-        } else {
-            vec!["--cm"]
-        };
-        let run_done;
-        if crate::platform::is_root() {
-            let mut res = Ok(None);
-            for _ in 0..10 {
-                #[cfg(not(any(target_os = "linux")))]
-                {
-                    log::debug!("Start cm");
-                    res = crate::platform::run_as_user(args.clone());
+            ensure_connection_manager().await?;
+            stream = crate::ipc::connect(1000, "_cm").await.ok();
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let args = vec!["--cm"];
+            let run_done;
+            if crate::platform::is_root() {
+                let mut res = Ok(None);
+                for _ in 0..10 {
+                    #[cfg(not(any(target_os = "linux")))]
+                    {
+                        log::debug!("Start cm");
+                        res = crate::platform::run_as_user(args.clone());
+                    }
+                    #[cfg(target_os = "linux")]
+                    {
+                        log::debug!("Start cm");
+                        res =
+                            crate::platform::run_as_user(args.clone(), None, None::<(&str, &str)>);
+                    }
+                    if res.is_ok() {
+                        break;
+                    }
+                    log::error!("Failed to run cm: {res:?}");
+                    sleep(1.).await;
                 }
-                #[cfg(target_os = "linux")]
-                {
-                    log::debug!("Start cm");
-                    res = crate::platform::run_as_user(args.clone(), None, None::<(&str, &str)>);
+                if let Some(task) = res? {
+                    super::CHILD_PROCESS.lock().unwrap().push(task);
                 }
-                if res.is_ok() {
+                run_done = true;
+            } else {
+                run_done = false;
+            }
+            if !run_done {
+                log::debug!("Start cm");
+                super::CHILD_PROCESS
+                    .lock()
+                    .unwrap()
+                    .push(crate::run_me(args)?);
+            }
+            for _ in 0..20 {
+                sleep(0.3).await;
+                if let Ok(s) = crate::ipc::connect(1000, "_cm").await {
+                    stream = Some(s);
                     break;
                 }
-                log::error!("Failed to run cm: {res:?}");
-                sleep(1.).await;
-            }
-            if let Some(task) = res? {
-                super::CHILD_PROCESS.lock().unwrap().push(task);
-            }
-            run_done = true;
-        } else {
-            run_done = false;
-        }
-        if !run_done {
-            log::debug!("Start cm");
-            super::CHILD_PROCESS
-                .lock()
-                .unwrap()
-                .push(crate::run_me(args)?);
-        }
-        for _ in 0..20 {
-            sleep(0.3).await;
-            if let Ok(s) = crate::ipc::connect(1000, "_cm").await {
-                stream = Some(s);
-                break;
             }
         }
     }
